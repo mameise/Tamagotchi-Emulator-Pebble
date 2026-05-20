@@ -320,7 +320,8 @@ function SaveStateAfterClosingApp(saveStateDict, isAutoSave)
     localStorage.setItem(LAST_STATE_KEY, JSON.stringify(saveStateDict));
     console.log("Saved last state to js localstorage... (autosave=" + isAutoSave + ")");
 
-    if(localStorage.getItem(APISERVER_KEY) !== null)
+    var apiServerUrl = localStorage.getItem(APISERVER_KEY);
+    if(apiServerUrl !== null && apiServerUrl.trim().length !== 0)
     {
         console.log("Sending save to server as well...");
         let payload = {
@@ -352,7 +353,7 @@ function SaveStateAfterClosingApp(saveStateDict, isAutoSave)
             'showing_attention_icon': saveStateDict.STATEshowing_attention_icon
         };
 
-        xhrRequest(localStorage.getItem(APISERVER_KEY) + "/state", 'POST', payload,
+        xhrRequest(apiServerUrl + "/state", 'POST', payload,
         (responseText) => { // success
             console.log("Successfully sent save state to server: " + responseText);
             if (!isAutoSave) {

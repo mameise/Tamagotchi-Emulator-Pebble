@@ -58,7 +58,11 @@ static flat_state_t stateToLoad = {0};
 static AppTimer *milli_tick_handler;
 static AppTimer *screen_tick_handler;
 
-// Auto-save: every 5 minutes, send state to phone but don't quit
+// Auto-save: every N minutes, send state to phone but don't quit.
+// NOTE: Set AUTOSAVE_ENABLED to 0 if you experience crashes after ~5 min.
+// The large state dump (~300+ bytes) over AppMessage can sometimes
+// destabilize the app. We are still investigating.
+#define AUTOSAVE_ENABLED 0
 #define AUTOSAVE_INTERVAL_MS (5 * 60 * 1000)
 static AppTimer *s_autosave_timer = NULL;
 
@@ -738,8 +742,14 @@ static void init() {
   // Auto RTC -> Tama sync (Handler intern filtert alle 2h + Drift-Toleranz)
   tick_timer_service_subscribe(HOUR_UNIT, rtc_sync_tick_handler);
 
-  // Start auto-save timer (saves every AUTOSAVE_INTERVAL_MS without quitting)
+  // Start auto-save timer (saves every AUTOSAVE_INTERVAL_MS without quitting).
+  // Disabled by default — flip AUTOSAVE_ENABLED above to 1 to enable.
+#if AUTOSAVE_ENABLED
   s_autosave_timer = app_timer_register(AUTOSAVE_INTERVAL_MS, autosave_timer_callback, NULL);
+  APP_LOG(APP_LOG_LEVEL_INFO, "Auto-save enabled, interval=%d ms", AUTOSAVE_INTERVAL_MS);
+#else
+  APP_LOG(APP_LOG_LEVEL_INFO, "Auto-save disabled");
+#endif
 
   // Show the Window on the watch, with animated=true
   window_stack_push(s_main_window, true);
