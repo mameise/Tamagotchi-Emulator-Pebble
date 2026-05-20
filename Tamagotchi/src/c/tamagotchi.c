@@ -473,6 +473,7 @@ static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) 
         APP_LOG(APP_LOG_LEVEL_INFO, "Using local persist state, skipping JS save");
         s_hasReceivedSaveFile = true;
         s_loadedFromPersist = true;
+        s_clearTextLayerOnScreenRefresh = true;  // clear "Loading ROM 100%"
         initTamalib();
       }
       // else: wait for save file from js (original behavior)
@@ -1004,7 +1005,12 @@ static bool persistSaveState(void)
 // was found and loaded. Called during init() before tamalib_init().
 static bool persistLoadState(void)
 {
-  if (!persist_exists(PERSIST_KEY_MAGIC)) return false;
+  APP_LOG(APP_LOG_LEVEL_DEBUG, "persistLoadState: starting");
+
+  if (!persist_exists(PERSIST_KEY_MAGIC)) {
+    APP_LOG(APP_LOG_LEVEL_DEBUG, "persistLoadState: no magic key -> first time or wiped");
+    return false;
+  }
 
   uint32_t magic = 0;
   persist_read_data(PERSIST_KEY_MAGIC, &magic, sizeof(magic));
@@ -1012,6 +1018,7 @@ static bool persistLoadState(void)
     APP_LOG(APP_LOG_LEVEL_WARNING, "persistLoadState: bad magic 0x%lx", (unsigned long)magic);
     return false;
   }
+  APP_LOG(APP_LOG_LEVEL_DEBUG, "persistLoadState: magic ok");
 
   if (!persist_exists(PERSIST_KEY_STATE_HEADER) ||
       !persist_exists(PERSIST_KEY_STATE_MEM1) ||
@@ -1066,8 +1073,14 @@ static bool persistLoadState(void)
   const size_t mem_half  = mem_total / 2;
   const size_t mem_rest  = mem_total - mem_half;
 
-  persist_read_data(PERSIST_KEY_STATE_MEM1, &stateToLoad.memory[0], mem_half);
-  persist_read_data(PERSIST_KEY_STATE_MEM2, ((uint8_t*)stateToLoad.memory) + mem_half, mem_rest);
+  int r1 = persist_read_data(PERSIST_KEY_STATE_MEM1, &stateToLoad.memory[0], mem_half);
+  int r2 = persist_read_data(PERSIST_KEY_STATE_MEM2, ((uint8_t*)stateToLoad.memory) + mem_half, mem_rest);
+  APP_LOG(APP_LOG_LEVEL_DEBUG, "persistLoadState: mem reads r1=%d r2=%d expected=%d+%d",
+          r1, r2, (int)mem_half, (int)mem_rest);
+  if (r1 != (int)mem_half || r2 != (int)mem_rest) {
+    APP_LOG(APP_LOG_LEVEL_WARNING, "persistLoadState: memory size mismatch -> aborting");
+    return false;
+  }
 
   if (persist_exists(PERSIST_KEY_ICONS)) {
     uint8_t icons[2] = {0};
