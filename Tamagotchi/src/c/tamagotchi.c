@@ -19,6 +19,7 @@ static void initTamalib(void);
 static void saveCurrentState(bool isAutoSave);
 static void saveCurrentStateAndQuit();
 static void autosave_timer_callback(void *data);
+static void rtc_sync_timer_callback(void *data);
 static void autosave_timer_callback(void *data);
 
 static Window *s_main_window;
@@ -718,11 +719,22 @@ static void initTamalib() {
   tama_rtc_initial_sync();
 }
 
-static void rtc_sync_tick_handler(struct tm *tick_time, TimeUnits units_changed)
+// RTC sync via AppTimer (statt tick_timer_service). Robusterer Ansatz
+// weil tick_timer_service primär für Watchfaces ist und in Watchapps
+// manchmal unerwartete Side-Effects hat.
+#define RTC_SYNC_CHECK_INTERVAL_MS (2 * 60 * 60 * 1000)  // alle 2 Stunden
+static AppTimer *s_rtc_sync_timer = NULL;
+
+static void rtc_sync_timer_callback(void *data)
 {
-  // Sicherheit: nur syncen wenn Emulator wirklich läuft
-  if (!s_hasReceivedRom || !s_hasReceivedSaveFile) return;
-  tama_rtc_hourly_tick(tick_time);
+  s_rtc_sync_timer = NULL;
+
+  if (s_hasReceivedRom && s_hasReceivedSaveFile) {
+    tama_rtc_periodic_check();
+  }
+
+  // Reschedule
+  s_rtc_sync_timer = app_timer_register(RTC_SYNC_CHECK_INTERVAL_MS, rtc_sync_timer_callback, NULL);
 }
 
 static void init() {
@@ -739,8 +751,8 @@ static void init() {
     .unload = main_window_unload
   });
 
-  // Auto RTC -> Tama sync (Handler intern filtert alle 2h + Drift-Toleranz)
-  tick_timer_service_subscribe(HOUR_UNIT, rtc_sync_tick_handler);
+  // Auto RTC -> Tama sync via AppTimer (alle 2h, mit Drift-Toleranz intern)
+  s_rtc_sync_timer = app_timer_register(RTC_SYNC_CHECK_INTERVAL_MS, rtc_sync_timer_callback, NULL);
 
   // Start auto-save timer (saves every AUTOSAVE_INTERVAL_MS without quitting).
   // Disabled by default — flip AUTOSAVE_ENABLED above to 1 to enable.
@@ -877,7 +889,10 @@ static void deinit() {
     app_timer_cancel(s_autosave_timer);
     s_autosave_timer = NULL;
   }
-  tick_timer_service_unsubscribe();
+  if (s_rtc_sync_timer) {
+    app_timer_cancel(s_rtc_sync_timer);
+    s_rtc_sync_timer = NULL;
+  }
   window_destroy(s_main_window);
 
   // Release tamalib

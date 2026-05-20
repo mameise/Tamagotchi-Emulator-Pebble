@@ -128,3 +128,33 @@ void tama_rtc_hourly_tick(struct tm *tick_time)
                      (uint8_t)tick_time->tm_min,
                      (uint8_t)tick_time->tm_sec);
 }
+
+void tama_rtc_periodic_check(void)
+{
+  if (!s_initial_sync_done) return;
+
+  time_t now = time(NULL);
+  struct tm *t = localtime(&now);
+  if (!t) return;
+
+  uint32_t pebble_sec = seconds_since_midnight_from_tm(t);
+  uint32_t tama_sec   = read_tama_seconds_since_midnight();
+
+  uint32_t diff = (pebble_sec > tama_sec)
+                  ? (pebble_sec - tama_sec)
+                  : (tama_sec - pebble_sec);
+  if (diff > 43200U) diff = 86400U - diff;
+
+  if (diff <= DRIFT_TOLERANCE_SEC) {
+    return; // silent, no log spam every check
+  }
+
+  APP_LOG(APP_LOG_LEVEL_INFO,
+          "RTC sync: drift %lu s -> resync auf %02d:%02d:%02d",
+          (unsigned long)diff,
+          t->tm_hour, t->tm_min, t->tm_sec);
+
+  write_time_to_tama((uint8_t)t->tm_hour,
+                     (uint8_t)t->tm_min,
+                     (uint8_t)t->tm_sec);
+}

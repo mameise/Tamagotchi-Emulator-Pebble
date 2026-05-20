@@ -31,9 +31,13 @@
 // tamalib_init / cpu_init_from_state aufgerufen.
 void tama_rtc_initial_sync(void);
 
-// Auto-Sync-Tick: prüft Drift gegen Toleranz-Schwellwert (30 s) und
-// schreibt nur dann neu. Wird vom tick_timer_service alle Stunde
-// aufgerufen und führt den Sync nur alle 2 Stunden durch.
+// Auto-Sync-Tick (tick_timer_service Variante): prüft Drift und syncs
+// nur bei H % 2 == 0. Wird vom HOUR_UNIT-Tick aufgerufen.
 void tama_rtc_hourly_tick(struct tm *tick_time);
+
+// Auto-Sync (AppTimer Variante): prüft jeden Aufruf die Drift und syncs
+// bei Bedarf, unabhängig von der Tageszeit. Einfacher und robuster als
+// tick_timer_service. Aufrufer registriert dazu einen periodischen AppTimer.
+void tama_rtc_periodic_check(void);
 
 #endif // TAMA_RTC_SYNC_H
