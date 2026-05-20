@@ -12,9 +12,11 @@
 
 #include <pebble.h>
 #include "tamalib/tamalib.h"
+#include "tama_rtc_sync.h"
 //#include "rom.h" 
 
 static void initTamalib(void); 
+static void saveCurrentState(bool isAutoSave);
 static void saveCurrentStateAndQuit();
 
 static Window *s_main_window;
@@ -53,6 +55,10 @@ static flat_state_t stateToLoad = {0};
 //ticks
 static AppTimer *milli_tick_handler;
 static AppTimer *screen_tick_handler;
+
+// Auto-save: every 5 minutes, send state to phone but don't quit
+#define AUTOSAVE_INTERVAL_MS (5 * 60 * 1000)
+static AppTimer *s_autosave_timer = NULL;
 
 static void Quit()
 {
@@ -701,9 +707,23 @@ static void initTamalib() {
     s_hasReceivedSaveFile = true;
     tamalib_init(g_program, NULL, 1000000);
   }
+
+  // Initialer RTC -> Tama Sync (in beiden Pfaden, da cpu_state nun bereit ist)
+  tama_rtc_initial_sync();
+}
+
+static void rtc_sync_tick_handler(struct tm *tick_time, TimeUnits units_changed)
+{
+  // Sicherheit: nur syncen wenn Emulator wirklich läuft
+  if (!s_hasReceivedRom || !s_hasReceivedSaveFile) return;
+  tama_rtc_hourly_tick(tick_time);
 }
 
 static void init() {
+  // Log why we (re)started — helps debug unexpected app restarts.
+  // APP_LAUNCH_TIMEOUT_TIMER_CANCELLED = OS killed us for inactivity/memory.
+  APP_LOG(APP_LOG_LEVEL_INFO, "App launched. reason=%d", (int)launch_reason());
+
   // Create main Window element and assign to pointer
   s_main_window = window_create();
 
@@ -713,8 +733,11 @@ static void init() {
     .unload = main_window_unload
   });
 
-  // Listen for seconds
-  //tick_timer_service_subscribe(SECOND_UNIT, tick_handler);
+  // Auto RTC -> Tama sync (Handler intern filtert alle 2h + Drift-Toleranz)
+  tick_timer_service_subscribe(HOUR_UNIT, rtc_sync_tick_handler);
+
+  // Start auto-save timer (saves every AUTOSAVE_INTERVAL_MS without quitting)
+  s_autosave_timer = app_timer_register(AUTOSAVE_INTERVAL_MS, autosave_timer_callback, NULL);
 
   // Show the Window on the watch, with animated=true
   window_stack_push(s_main_window, true);
@@ -728,16 +751,19 @@ static void init() {
   window_set_click_config_provider(s_main_window, click_config_provider);
 }
 
-static void saveCurrentStateAndQuit()
+static void saveCurrentState(bool isAutoSave)
 {
   if (!s_hasReceivedRom)
   {
-     Quit(); // no point in sending save if we don't even have the rom yet.
+    if (!isAutoSave) Quit(); // manual save without rom: just quit
+    return; // auto-save without rom: skip silently
   }
 
-  Message("Saving state...");
+  if (!isAutoSave) {
+    Message("Saving state...");
+  }
   
-  APP_LOG(APP_LOG_LEVEL_DEBUG, "Getting save file and sending to phone...");
+  APP_LOG(APP_LOG_LEVEL_DEBUG, "Getting save file and sending to phone... (autosave=%d)", (int)isAutoSave);
 
   // Send save file to phone 
   flat_state_t saveState = cpu_get_flat_state();
@@ -748,6 +774,10 @@ static void saveCurrentStateAndQuit()
   // Prepare the outbox buffer for this message
   AppMessageResult result = app_message_outbox_begin(&out_iter);
   if(result == APP_MSG_OK) {
+    // Mark this message as auto-save so JS knows not to send JSFinishedSaving back
+    uint8_t autosave_flag = isAutoSave ? 1 : 0;
+    dict_write_int(out_iter, MESSAGE_KEY_AutoSave, &autosave_flag, sizeof(uint8_t), false);
+
     // Construct the message
     dict_write_int(out_iter, MESSAGE_KEY_STATEpc, &saveState.pc, sizeof(uint16_t), false);
     dict_write_int(out_iter, MESSAGE_KEY_STATEx, &saveState.x, sizeof(uint16_t), false);
@@ -790,23 +820,52 @@ static void saveCurrentStateAndQuit()
     // Check the result
     if(result != APP_MSG_OK) {
       APP_LOG(APP_LOG_LEVEL_ERROR, "Error sending the outbox: %d", (int)result);
-      Message("Can't send state!"); //TODO handle better
-      Quit();
+      if (!isAutoSave) {
+        Message("Can't send state!"); //TODO handle better
+        Quit();
+      }
+      // auto-save failure: just log and try again next interval
     }
     else
     {
-      APP_LOG(APP_LOG_LEVEL_DEBUG, "Save file sent successfully to phone!");
-      //now will wait for response from js to quit
+      APP_LOG(APP_LOG_LEVEL_DEBUG, "Save file sent successfully to phone! (autosave=%d)", (int)isAutoSave);
+      //for non-autosave: will wait for response from js to quit
     }
   } else {
     // The outbox cannot be used right now
     APP_LOG(APP_LOG_LEVEL_ERROR, "Error preparing the outbox: %d", (int)result);
-    Message("Can't send state!"); //TODO handle better
-    Quit();
+    if (!isAutoSave) {
+      Message("Can't send state!"); //TODO handle better
+      Quit();
+    }
   }
 }
 
+static void saveCurrentStateAndQuit()
+{
+  saveCurrentState(false);
+}
+
+// AppTimer callback: triggers auto-save and reschedules itself.
+// Lifetime is tied to the app; PebbleOS auto-cancels timers on app exit.
+static void autosave_timer_callback(void *data)
+{
+  s_autosave_timer = NULL; // timer fired, slot is free
+
+  if (s_hasReceivedRom && s_hasReceivedSaveFile) {
+    saveCurrentState(true);
+  }
+
+  // Reschedule (regardless of whether we actually saved, so it keeps trying)
+  s_autosave_timer = app_timer_register(AUTOSAVE_INTERVAL_MS, autosave_timer_callback, NULL);
+}
+
 static void deinit() {
+  if (s_autosave_timer) {
+    app_timer_cancel(s_autosave_timer);
+    s_autosave_timer = NULL;
+  }
+  tick_timer_service_unsubscribe();
   window_destroy(s_main_window);
 
   // Release tamalib
