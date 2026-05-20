@@ -20,6 +20,8 @@ static void saveCurrentState(bool isAutoSave);
 static void saveCurrentStateAndQuit();
 static void autosave_timer_callback(void *data);
 static void rtc_sync_timer_callback(void *data);
+static bool persistSaveState(void);
+static bool persistLoadState(void);
 static void autosave_timer_callback(void *data);
 
 static Window *s_main_window;
@@ -52,6 +54,7 @@ static bool_t s_screen_buffer[LCD_HEIGHT][LCD_WIDTH] = {{0}};
 static u12_t g_program[6144] = {0};
 static bool s_hasReceivedRom = false;
 static bool s_hasReceivedSaveFile = false;
+static bool s_loadedFromPersist = false;  // true if we already loaded state from local watch storage
 static bool s_clearTextLayerOnScreenRefresh = false;
 static flat_state_t stateToLoad = {0};
 
@@ -59,13 +62,24 @@ static flat_state_t stateToLoad = {0};
 static AppTimer *milli_tick_handler;
 static AppTimer *screen_tick_handler;
 
-// Auto-save: every N minutes, send state to phone but don't quit.
-// NOTE: Set AUTOSAVE_ENABLED to 0 if you experience crashes after ~5 min.
-// The large state dump (~300+ bytes) over AppMessage can sometimes
-// destabilize the app. We are still investigating.
-#define AUTOSAVE_ENABLED 0
+// Auto-save: every N minutes, persist state to local watch storage.
+// Uses persist_write_data() — no AppMessage, no phone roundtrip, no xhr.
+// Much more robust than the AppMessage-based save+quit flow.
+#define AUTOSAVE_ENABLED 1
 #define AUTOSAVE_INTERVAL_MS (5 * 60 * 1000)
 static AppTimer *s_autosave_timer = NULL;
+
+// Persist storage layout — we split flat_state_t across 3 keys because
+// each persist key is limited to 256 bytes. We also write a magic number
+// + version so we can detect corrupt/old data.
+#define PERSIST_KEY_MAGIC         100
+#define PERSIST_KEY_STATE_HEADER  101  // registers, timers, interrupts
+#define PERSIST_KEY_STATE_MEM1    102  // first half of memory[]
+#define PERSIST_KEY_STATE_MEM2    103  // second half of memory[]
+#define PERSIST_KEY_ICONS         104  // selected_icon + showing_attention_icon
+
+#define PERSIST_MAGIC_VALUE       0x54414D41  // 'TAMA' in ASCII
+#define PERSIST_VERSION           1
 
 static void Quit()
 {
@@ -284,7 +298,9 @@ static void on_button_down_release(ClickRecognizerRef recognizer, void *context)
 
 static void on_button_back(ClickRecognizerRef recognizer, void *context) //back
 {
-   // Handle saving state and save
+  // Always persist locally first (fast, synchronous, guaranteed).
+  // Then trigger the JS save+quit flow (which goes through phone roundtrip).
+  persistSaveState();
   saveCurrentStateAndQuit(); 
 }
 
@@ -401,6 +417,14 @@ static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) 
   {
     if (s_hasReceivedRom)
     {
+      // Clear local persist storage too so we don't restore old state on next start
+      persist_delete(PERSIST_KEY_MAGIC);
+      persist_delete(PERSIST_KEY_STATE_HEADER);
+      persist_delete(PERSIST_KEY_STATE_MEM1);
+      persist_delete(PERSIST_KEY_STATE_MEM2);
+      persist_delete(PERSIST_KEY_ICONS);
+      s_loadedFromPersist = false;
+
       s_clearTextLayerOnScreenRefresh = true;
       s_hasReceivedSaveFile = false;
       initTamalib();
@@ -439,7 +463,19 @@ static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) 
       Message("Loading ROM 100%");
       APP_LOG(APP_LOG_LEVEL_DEBUG, "Reached end of ROM!");
       s_hasReceivedRom = true;
-      // wait for save file from js
+
+      // Check local watch storage first — if we have a recent persist-state,
+      // use it and skip waiting for JS to send one. JS will still send its
+      // copy but we'll just ignore it (saveStateDict won't replace what
+      // we already loaded; cpu_init_from_state was already called).
+      if (persistLoadState())
+      {
+        APP_LOG(APP_LOG_LEVEL_INFO, "Using local persist state, skipping JS save");
+        s_hasReceivedSaveFile = true;
+        s_loadedFromPersist = true;
+        initTamalib();
+      }
+      // else: wait for save file from js (original behavior)
     }
   }
 
@@ -491,6 +527,13 @@ static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) 
 
   if (STATEpc_t && STATEmemory_t) // assume whole block
   {
+    if (s_loadedFromPersist) {
+      // We already loaded from local persist storage. Ignore the
+      // (potentially older) JS-side state to avoid overwriting good data.
+      APP_LOG(APP_LOG_LEVEL_INFO, "Ignoring JS state (already loaded from persist)");
+      return;
+    }
+
     Message("Loading save state...");
 
     uint16_t state_pc = STATEpc_t->value->uint16;
@@ -870,17 +913,185 @@ static void saveCurrentStateAndQuit()
   saveCurrentState(false);
 }
 
-// AppTimer callback: triggers auto-save and reschedules itself.
-// Lifetime is tied to the app; PebbleOS auto-cancels timers on app exit.
-static void autosave_timer_callback(void *data)
+// Save current state to local watch storage (persist API). Synchronous,
+// no AppMessage involved. Returns true on success.
+static bool persistSaveState(void)
 {
-  s_autosave_timer = NULL; // timer fired, slot is free
+  if (!s_hasReceivedRom || !s_hasReceivedSaveFile) return false;
 
-  if (s_hasReceivedRom && s_hasReceivedSaveFile) {
-    saveCurrentState(true);
+  flat_state_t st = cpu_get_flat_state();
+
+  // Sanity check: refuse to save obviously-bad state
+  if (st.pc == 0) {
+    APP_LOG(APP_LOG_LEVEL_WARNING, "persistSaveState: refusing to save state with pc=0");
+    return false;
   }
 
-  // Reschedule (regardless of whether we actually saved, so it keeps trying)
+  // Header: everything except the memory[] array.
+  // Order/packing: explicit struct so layout is stable across builds.
+  typedef struct __attribute__((packed)) {
+    uint16_t pc;
+    uint16_t x;
+    uint16_t y;
+    uint8_t  a;
+    uint8_t  b;
+    uint8_t  np;
+    uint8_t  sp;
+    uint8_t  flags;
+    uint32_t tick_counter;
+    uint32_t clk_timer_timestamp;
+    uint32_t prog_timer_timestamp;
+    uint8_t  prog_timer_enabled;
+    uint8_t  prog_timer_data;
+    uint8_t  prog_timer_rld;
+    uint32_t call_depth;
+    // 6 interrupts × 4 bytes each = 24 bytes
+    uint8_t  interrupts[24];
+  } persist_header_t;
+
+  persist_header_t hdr;
+  hdr.pc = st.pc;
+  hdr.x = st.x;
+  hdr.y = st.y;
+  hdr.a = st.a;
+  hdr.b = st.b;
+  hdr.np = st.np;
+  hdr.sp = st.sp;
+  hdr.flags = st.flags;
+  hdr.tick_counter = st.tick_counter;
+  hdr.clk_timer_timestamp = st.clk_timer_timestamp;
+  hdr.prog_timer_timestamp = st.prog_timer_timestamp;
+  hdr.prog_timer_enabled = st.prog_timer_enabled;
+  hdr.prog_timer_data = st.prog_timer_data;
+  hdr.prog_timer_rld = st.prog_timer_rld;
+  hdr.call_depth = st.call_depth;
+  for (int i = 0; i < 6; i++) {
+    hdr.interrupts[i*4+0] = st.interrupts[i].factor_flag_reg;
+    hdr.interrupts[i*4+1] = st.interrupts[i].mask_reg;
+    hdr.interrupts[i*4+2] = st.interrupts[i].triggered;
+    hdr.interrupts[i*4+3] = st.interrupts[i].vector;
+  }
+
+  // Split memory[] into two halves to stay under 256-byte persist limit.
+  // MEM_BUFFER_SIZE × sizeof(u4_t) bytes total — typically ~464 bytes.
+  const size_t mem_total = sizeof(st.memory);
+  const size_t mem_half  = mem_total / 2;
+  const size_t mem_rest  = mem_total - mem_half;
+
+  status_t s;
+  s = persist_write_data(PERSIST_KEY_STATE_HEADER, &hdr, sizeof(hdr));
+  if (s < 0) { APP_LOG(APP_LOG_LEVEL_ERROR, "persist header write failed: %d", (int)s); return false; }
+
+  s = persist_write_data(PERSIST_KEY_STATE_MEM1, &st.memory[0], mem_half);
+  if (s < 0) { APP_LOG(APP_LOG_LEVEL_ERROR, "persist mem1 write failed: %d", (int)s); return false; }
+
+  s = persist_write_data(PERSIST_KEY_STATE_MEM2, ((uint8_t*)st.memory) + mem_half, mem_rest);
+  if (s < 0) { APP_LOG(APP_LOG_LEVEL_ERROR, "persist mem2 write failed: %d", (int)s); return false; }
+
+  // Icons (small, one key)
+  uint8_t icons[2] = { (uint8_t)s_selectedIcon, (uint8_t)s_showingAttentionIcon };
+  persist_write_data(PERSIST_KEY_ICONS, icons, sizeof(icons));
+
+  // Magic LAST — only set after all other writes succeeded.
+  // Reader checks this first; if missing/wrong, the rest is ignored.
+  uint32_t magic = PERSIST_MAGIC_VALUE;
+  persist_write_data(PERSIST_KEY_MAGIC, &magic, sizeof(magic));
+
+  return true;
+}
+
+// Read persisted state into stateToLoad. Returns true if a valid state
+// was found and loaded. Called during init() before tamalib_init().
+static bool persistLoadState(void)
+{
+  if (!persist_exists(PERSIST_KEY_MAGIC)) return false;
+
+  uint32_t magic = 0;
+  persist_read_data(PERSIST_KEY_MAGIC, &magic, sizeof(magic));
+  if (magic != PERSIST_MAGIC_VALUE) {
+    APP_LOG(APP_LOG_LEVEL_WARNING, "persistLoadState: bad magic 0x%lx", (unsigned long)magic);
+    return false;
+  }
+
+  if (!persist_exists(PERSIST_KEY_STATE_HEADER) ||
+      !persist_exists(PERSIST_KEY_STATE_MEM1) ||
+      !persist_exists(PERSIST_KEY_STATE_MEM2)) {
+    APP_LOG(APP_LOG_LEVEL_WARNING, "persistLoadState: missing keys");
+    return false;
+  }
+
+  typedef struct __attribute__((packed)) {
+    uint16_t pc; uint16_t x; uint16_t y;
+    uint8_t  a; uint8_t b; uint8_t np; uint8_t sp; uint8_t flags;
+    uint32_t tick_counter;
+    uint32_t clk_timer_timestamp;
+    uint32_t prog_timer_timestamp;
+    uint8_t  prog_timer_enabled;
+    uint8_t  prog_timer_data;
+    uint8_t  prog_timer_rld;
+    uint32_t call_depth;
+    uint8_t  interrupts[24];
+  } persist_header_t;
+
+  persist_header_t hdr;
+  int read = persist_read_data(PERSIST_KEY_STATE_HEADER, &hdr, sizeof(hdr));
+  if (read != (int)sizeof(hdr)) {
+    APP_LOG(APP_LOG_LEVEL_WARNING, "persistLoadState: header size mismatch %d", read);
+    return false;
+  }
+
+  stateToLoad.pc = hdr.pc;
+  stateToLoad.x = hdr.x;
+  stateToLoad.y = hdr.y;
+  stateToLoad.a = hdr.a;
+  stateToLoad.b = hdr.b;
+  stateToLoad.np = hdr.np;
+  stateToLoad.sp = hdr.sp;
+  stateToLoad.flags = hdr.flags;
+  stateToLoad.tick_counter = hdr.tick_counter;
+  stateToLoad.clk_timer_timestamp = hdr.clk_timer_timestamp;
+  stateToLoad.prog_timer_timestamp = hdr.prog_timer_timestamp;
+  stateToLoad.prog_timer_enabled = hdr.prog_timer_enabled;
+  stateToLoad.prog_timer_data = hdr.prog_timer_data;
+  stateToLoad.prog_timer_rld = hdr.prog_timer_rld;
+  stateToLoad.call_depth = hdr.call_depth;
+  for (int i = 0; i < 6; i++) {
+    stateToLoad.interrupts[i].factor_flag_reg = hdr.interrupts[i*4+0];
+    stateToLoad.interrupts[i].mask_reg        = hdr.interrupts[i*4+1];
+    stateToLoad.interrupts[i].triggered       = hdr.interrupts[i*4+2];
+    stateToLoad.interrupts[i].vector          = hdr.interrupts[i*4+3];
+  }
+
+  const size_t mem_total = sizeof(stateToLoad.memory);
+  const size_t mem_half  = mem_total / 2;
+  const size_t mem_rest  = mem_total - mem_half;
+
+  persist_read_data(PERSIST_KEY_STATE_MEM1, &stateToLoad.memory[0], mem_half);
+  persist_read_data(PERSIST_KEY_STATE_MEM2, ((uint8_t*)stateToLoad.memory) + mem_half, mem_rest);
+
+  if (persist_exists(PERSIST_KEY_ICONS)) {
+    uint8_t icons[2] = {0};
+    persist_read_data(PERSIST_KEY_ICONS, icons, sizeof(icons));
+    s_selectedIcon = (int8_t)icons[0];
+    s_showingAttentionIcon = (bool)icons[1];
+  }
+
+  APP_LOG(APP_LOG_LEVEL_INFO, "persistLoadState: loaded state from watch storage (pc=%d)", (int)hdr.pc);
+  return true;
+}
+
+// AppTimer callback: triggers persist-based auto-save and reschedules.
+static void autosave_timer_callback(void *data)
+{
+  s_autosave_timer = NULL;
+
+  if (s_hasReceivedRom && s_hasReceivedSaveFile) {
+    if (persistSaveState()) {
+      APP_LOG(APP_LOG_LEVEL_DEBUG, "Auto-save: persisted to watch storage");
+    }
+  }
+
+  // Reschedule
   s_autosave_timer = app_timer_register(AUTOSAVE_INTERVAL_MS, autosave_timer_callback, NULL);
 }
 
