@@ -18,6 +18,8 @@
 static void initTamalib(void); 
 static void saveCurrentState(bool isAutoSave);
 static void saveCurrentStateAndQuit();
+static void autosave_timer_callback(void *data);
+static void autosave_timer_callback(void *data);
 
 static Window *s_main_window;
 static BitmapLayer *s_background_layer;
