@@ -811,13 +811,13 @@ static void main_window_load(Window *window) {
   // Pebble Time 2: 260x260, tama LCD at y=92-172
   s_time_layer    = text_layer_create(GRect(10,  15, 100, 32));
   s_battery_layer = text_layer_create(GRect(150, 15, 100, 32));
-  s_date_layer    = text_layer_create(GRect(10, 185, 240, 32));
+  s_date_layer    = text_layer_create(GRect(10, 215, 240, 32));
   GFont big_font = fonts_get_system_font(FONT_KEY_GOTHIC_28_BOLD);
 #elif defined(PBL_PLATFORM_EMERY)
   // Emery: 200x228, tama LCD at y=76-156
   s_time_layer    = text_layer_create(GRect(8,  10,  80, 26));
   s_battery_layer = text_layer_create(GRect(110, 10, 80, 26));
-  s_date_layer    = text_layer_create(GRect(10, 170, 180, 26));
+  s_date_layer    = text_layer_create(GRect(10, 195, 180, 26));
   GFont big_font = fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD);
 #elif defined(PBL_PLATFORM_CHALK)
   // Round 180x180 — corners less useful, use top-center / bottom-center
