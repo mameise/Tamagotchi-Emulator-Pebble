@@ -158,10 +158,10 @@ static void hal_set_lcd_icon(u8_t icon, bool_t val)
   layer_mark_dirty(s_icons_layer);
 }
 
-// Vibration on Tama buzzer activity.
-// The Tama beeps to get the user's attention (hunger, sickness, etc).
-// We map buzzer-on -> one vibration pulse per "beep phase", with a
-// minimum gap so we don't vibrate every few ms during fast buzzer toggles.
+// Vibration on Tama buzzer activity — but only when the attention icon
+// is showing. That way the watch only buzzes for real needs (hunger,
+// sickness, etc), not for menu/button feedback beeps which also use
+// the same buzzer.
 #define VIBE_COOLDOWN_MS 5000
 static bool s_buzzer_on = false;        // current state from emulator
 static time_t s_last_vibe_ts = 0;       // last vibration timestamp (epoch seconds)
@@ -169,8 +169,9 @@ static time_t s_last_vibe_ts = 0;       // last vibration timestamp (epoch secon
 static void hal_set_frequency(u32_t freq) { } //TODO later for pebbles with speaker?
 static void hal_play_frequency(bool_t en)
 {
-  // Detect edge: only act on off->on transitions
-  if (en && !s_buzzer_on) {
+  // Detect edge: only act on off->on transitions, and only if the tama
+  // is signaling a need (attention icon visible).
+  if (en && !s_buzzer_on && s_showingAttentionIcon) {
     time_t now = time(NULL);
     if (now - s_last_vibe_ts >= (VIBE_COOLDOWN_MS / 1000)) {
       vibes_long_pulse();
