@@ -410,7 +410,14 @@ static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) 
   if(ready_tuple_t && !s_js_ready) {
     // PebbleKit JS is ready! Safe to send messages
     s_js_ready = true;
-    Message("Loading ROM 0%");
+    // Only show the "loading from phone" message if we don't have a ROM yet.
+    // If we already booted from local resource, this would just overlay text
+    // on top of a happily-running emulator.
+    if (!s_hasReceivedRom) {
+      Message("Loading ROM 0%");
+    } else {
+      APP_LOG(APP_LOG_LEVEL_DEBUG, "JS ready but we already booted locally");
+    }
   }
 
   Tuple *reset_tamagotchi_t = dict_find(iter, MESSAGE_KEY_reset_tamagotchi);
