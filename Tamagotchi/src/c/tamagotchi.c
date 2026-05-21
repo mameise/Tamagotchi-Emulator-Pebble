@@ -23,6 +23,7 @@ static void rtc_sync_timer_callback(void *data);
 static bool persistSaveState(void);
 static bool persistLoadState(void);
 static bool loadRomFromResource(void);
+static void local_boot_timer_callback(void *data);
 static void autosave_timer_callback(void *data);
 
 static Window *s_main_window;
@@ -801,6 +802,31 @@ static void rtc_sync_timer_callback(void *data)
   s_rtc_sync_timer = app_timer_register(RTC_SYNC_CHECK_INTERVAL_MS, rtc_sync_timer_callback, NULL);
 }
 
+// One-shot timer callback: try local boot after init() returned and the
+// Pebble event loop is running. This avoids any lifecycle weirdness from
+// initializing tamalib/timers while still inside init().
+static void local_boot_timer_callback(void *data)
+{
+  if (s_hasReceivedRom) return;  // safety: already booted somehow
+
+  if (loadRomFromResource()) {
+    s_hasReceivedRom = true;
+    s_clearTextLayerOnScreenRefresh = true;
+
+    if (persistLoadState()) {
+      APP_LOG(APP_LOG_LEVEL_INFO, "Local boot: ROM + persist state loaded");
+      s_hasReceivedSaveFile = true;
+      s_loadedFromPersist = true;
+      initTamalib();
+    } else {
+      APP_LOG(APP_LOG_LEVEL_INFO, "Local boot: ROM loaded, no persist state -> fresh start");
+      initTamalib();
+    }
+  } else {
+    APP_LOG(APP_LOG_LEVEL_WARNING, "No local ROM resource — falling back to phone");
+  }
+}
+
 static void init() {
   // Log why we (re)started — helps debug unexpected app restarts.
   // APP_LAUNCH_TIMEOUT_TIMER_CANCELLED = OS killed us for inactivity/memory.
@@ -830,38 +856,18 @@ static void init() {
   // Show the Window on the watch, with animated=true
   window_stack_push(s_main_window, true);
 
-  // Try to bring the emulator up entirely from local data — no phone needed.
-  // Step 1: ROM from app resource (always present, baked at build time).
-  // Step 2: state from persist storage (only present if user has played before).
-  // If both succeed, we're playing immediately even without a phone connection.
-  if (loadRomFromResource()) {
-    s_hasReceivedRom = true;
-    s_clearTextLayerOnScreenRefresh = true;
-
-    if (persistLoadState()) {
-      APP_LOG(APP_LOG_LEVEL_INFO, "Local boot: ROM + persist state loaded");
-      s_hasReceivedSaveFile = true;
-      s_loadedFromPersist = true;
-      initTamalib();
-    } else {
-      // ROM is here but no save yet — start a fresh tama
-      APP_LOG(APP_LOG_LEVEL_INFO, "Local boot: ROM loaded, no persist state -> fresh start");
-      initTamalib();  // initTamalib checks s_hasReceivedSaveFile internally
-    }
-  } else {
-    // Resource load failed — keep classic phone-driven boot path as fallback.
-    // This keeps the watchapp working on a build that someone forgot to
-    // include the ROM in.
-    APP_LOG(APP_LOG_LEVEL_WARNING, "No local ROM resource — falling back to phone");
-  }
-
-  // Open AppMessage connection
+  // Open AppMessage connection BEFORE attempting local boot, so the
+  // app's communication layer is fully initialized first.
   app_message_register_inbox_received(prv_inbox_received_handler);
-  //app_message_open(256, 128); 
-  app_message_open(2048, 2048); // tested on pebble 2 duo
+  app_message_open(2048, 2048);
 
   // Listen for button events
   window_set_click_config_provider(s_main_window, click_config_provider);
+
+  // Defer local boot to after init() returns and the Pebble event loop
+  // is properly running. Schedule a one-shot timer with minimal delay.
+  // The 50ms gives PebbleOS time to settle window/event/message state.
+  app_timer_register(50, local_boot_timer_callback, NULL);
 }
 
 static void saveCurrentState(bool isAutoSave)
