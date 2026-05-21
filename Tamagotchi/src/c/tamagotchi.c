@@ -158,8 +158,27 @@ static void hal_set_lcd_icon(u8_t icon, bool_t val)
   layer_mark_dirty(s_icons_layer);
 }
 
+// Vibration on Tama buzzer activity.
+// The Tama beeps to get the user's attention (hunger, sickness, etc).
+// We map buzzer-on -> one vibration pulse per "beep phase", with a
+// minimum gap so we don't vibrate every few ms during fast buzzer toggles.
+#define VIBE_COOLDOWN_MS 5000
+static bool s_buzzer_on = false;        // current state from emulator
+static time_t s_last_vibe_ts = 0;       // last vibration timestamp (epoch seconds)
+
 static void hal_set_frequency(u32_t freq) { } //TODO later for pebbles with speaker?
-static void hal_play_frequency(bool_t en) { } //TODO later for pebbles with speaker?
+static void hal_play_frequency(bool_t en)
+{
+  // Detect edge: only act on off->on transitions
+  if (en && !s_buzzer_on) {
+    time_t now = time(NULL);
+    if (now - s_last_vibe_ts >= (VIBE_COOLDOWN_MS / 1000)) {
+      vibes_long_pulse();
+      s_last_vibe_ts = now;
+    }
+  }
+  s_buzzer_on = en;
+}
 
 static int hal_handler(void)
 {
