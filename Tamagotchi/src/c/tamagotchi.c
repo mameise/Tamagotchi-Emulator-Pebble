@@ -772,20 +772,29 @@ static void main_window_load(Window *window) {
   text_layer_set_overflow_mode(s_text_layer, GTextOverflowModeWordWrap);
   layer_add_child(window_layer, text_layer_get_layer(s_text_layer));
 
-  // Battery indicator: small text below the tama LCD
+  // Battery indicator: top-right corner on the watch frame (not over the tama LCD).
+  // Larger font, white text so it's clearly visible against the dark background.
 #if defined(PBL_PLATFORM_CHALK)
-  s_battery_layer = text_layer_create(GRect(0, 145, 180, 18));
+  // Round 180x180 — top-center works better than corner on round watches
+  s_battery_layer = text_layer_create(GRect(60, 8, 60, 24));
 #elif defined(PBL_PLATFORM_GABBRO)
-  s_battery_layer = text_layer_create(GRect(0, 200, 260, 22));
+  // Pebble Time 2: 260x260. Tama LCD at y=92-172. Top-right above the frame.
+  s_battery_layer = text_layer_create(GRect(165, 15, 85, 28));
 #elif defined(PBL_PLATFORM_EMERY)
-  s_battery_layer = text_layer_create(GRect(0, 175, 200, 20));
+  // 200x228. Top-right above tama LCD (which starts ~y=76).
+  s_battery_layer = text_layer_create(GRect(120, 10, 75, 24));
 #else
-  s_battery_layer = text_layer_create(GRect(0, 140, 144, 18));
+  // 144x168 (Diorite/Basalt). Top-right above tama LCD (which starts y=51).
+  s_battery_layer = text_layer_create(GRect(85, 6, 55, 22));
 #endif
   text_layer_set_background_color(s_battery_layer, GColorClear);
-  text_layer_set_text_color(s_battery_layer, GColorBlack);
-  text_layer_set_text_alignment(s_battery_layer, GTextAlignmentCenter);
-  text_layer_set_font(s_battery_layer, fonts_get_system_font(FONT_KEY_GOTHIC_14));
+  text_layer_set_text_color(s_battery_layer, GColorWhite);
+  text_layer_set_text_alignment(s_battery_layer, GTextAlignmentRight);
+#if defined(PBL_PLATFORM_GABBRO)
+  text_layer_set_font(s_battery_layer, fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD));
+#else
+  text_layer_set_font(s_battery_layer, fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD));
+#endif
   layer_add_child(window_layer, text_layer_get_layer(s_battery_layer));
 
   // Subscribe to battery updates + show initial value
