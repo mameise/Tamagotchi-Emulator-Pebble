@@ -809,39 +809,49 @@ static void main_window_load(Window *window) {
 
 #if defined(PBL_PLATFORM_GABBRO)
   // Pebble Time 2: 260x260, tama LCD at y=92-172
-  s_time_layer    = text_layer_create(GRect(10,  15, 100, 32));
-  s_battery_layer = text_layer_create(GRect(150, 15, 100, 32));
+  s_time_layer    = text_layer_create(GRect(10,   2, 130, 50));
+  s_battery_layer = text_layer_create(GRect(140, 10, 115, 36));
   s_date_layer    = text_layer_create(GRect(10, 215, 240, 32));
-  GFont big_font = fonts_get_system_font(FONT_KEY_GOTHIC_28_BOLD);
+  GFont time_font    = fonts_get_system_font(FONT_KEY_BITHAM_42_BOLD);
+  GFont small_font   = fonts_get_system_font(FONT_KEY_GOTHIC_28_BOLD);
 #elif defined(PBL_PLATFORM_EMERY)
   // Emery: 200x228, tama LCD at y=76-156
-  s_time_layer    = text_layer_create(GRect(8,  10,  80, 26));
-  s_battery_layer = text_layer_create(GRect(110, 10, 80, 26));
+  s_time_layer    = text_layer_create(GRect(8,   2, 110, 42));
+  s_battery_layer = text_layer_create(GRect(118, 8, 80, 30));
   s_date_layer    = text_layer_create(GRect(10, 195, 180, 26));
-  GFont big_font = fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD);
+  GFont time_font    = fonts_get_system_font(FONT_KEY_BITHAM_34_MEDIUM_NUMBERS);
+  GFont small_font   = fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD);
 #elif defined(PBL_PLATFORM_CHALK)
   // Round 180x180 — corners less useful, use top-center / bottom-center
-  s_time_layer    = text_layer_create(GRect(10,   8, 65, 22));
-  s_battery_layer = text_layer_create(GRect(105,  8, 65, 22));
+  s_time_layer    = text_layer_create(GRect(10,   4, 80, 30));
+  s_battery_layer = text_layer_create(GRect(90,   8, 80, 22));
   s_date_layer    = text_layer_create(GRect(0,  148, 180, 22));
-  GFont big_font = fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD);
+  GFont time_font    = fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD);
+  GFont small_font   = fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD);
 #else
   // Diorite/Basalt 144x168, tama LCD at y=51-115
-  s_time_layer    = text_layer_create(GRect(4,   4, 60, 22));
-  s_battery_layer = text_layer_create(GRect(80,  4, 60, 22));
+  s_time_layer    = text_layer_create(GRect(4,   0, 80, 28));
+  s_battery_layer = text_layer_create(GRect(84,  6, 60, 22));
   s_date_layer    = text_layer_create(GRect(0, 135, 144, 22));
-  GFont big_font = fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD);
+  GFont time_font    = fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD);
+  GFont small_font   = fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD);
 #endif
 
-  // Common style for all three
-  TextLayer *infos[3] = { s_time_layer, s_battery_layer, s_date_layer };
-  GTextAlignment alignments[3] = { GTextAlignmentLeft, GTextAlignmentRight, GTextAlignmentCenter };
-  for (int i = 0; i < 3; i++) {
-    text_layer_set_background_color(infos[i], GColorClear);
-    text_layer_set_text_color(infos[i], GColorWhite);
-    text_layer_set_text_alignment(infos[i], alignments[i]);
-    text_layer_set_font(infos[i], big_font);
-    layer_add_child(window_layer, text_layer_get_layer(infos[i]));
+  // Common style for all three. Time gets its own (bigger) font.
+  text_layer_set_background_color(s_time_layer, GColorClear);
+  text_layer_set_text_color(s_time_layer, GColorWhite);
+  text_layer_set_text_alignment(s_time_layer, GTextAlignmentLeft);
+  text_layer_set_font(s_time_layer, time_font);
+  layer_add_child(window_layer, text_layer_get_layer(s_time_layer));
+
+  TextLayer *small_infos[2] = { s_battery_layer, s_date_layer };
+  GTextAlignment small_aligns[2] = { GTextAlignmentRight, GTextAlignmentCenter };
+  for (int i = 0; i < 2; i++) {
+    text_layer_set_background_color(small_infos[i], GColorClear);
+    text_layer_set_text_color(small_infos[i], GColorWhite);
+    text_layer_set_text_alignment(small_infos[i], small_aligns[i]);
+    text_layer_set_font(small_infos[i], small_font);
+    layer_add_child(window_layer, text_layer_get_layer(small_infos[i]));
   }
 
   // Initial values + subscriptions
