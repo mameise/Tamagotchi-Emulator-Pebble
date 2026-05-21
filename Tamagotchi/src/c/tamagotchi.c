@@ -31,6 +31,8 @@ static BitmapLayer *s_background_layer;
 static Layer *s_screen_layer;
 static Layer *s_icons_layer;
 static TextLayer *s_text_layer;
+static TextLayer *s_battery_layer = NULL;
+static char s_battery_text[8] = "";
 //static GFont s_lcd_font;
 
 // Bitmaps
@@ -158,25 +160,37 @@ static void hal_set_lcd_icon(u8_t icon, bool_t val)
   layer_mark_dirty(s_icons_layer);
 }
 
-// Vibration on Tama buzzer activity — but only when the attention icon
-// is showing. That way the watch only buzzes for real needs (hunger,
-// sickness, etc), not for menu/button feedback beeps which also use
-// the same buzzer.
-#define VIBE_COOLDOWN_MS 5000
-static bool s_buzzer_on = false;        // current state from emulator
-static time_t s_last_vibe_ts = 0;       // last vibration timestamp (epoch seconds)
+// Vibration on Tama buzzer activity. Goal: exactly one vibration when
+// the tama starts asking for attention. The cooldown is anchored to the
+// rising edge of the attention icon — not to the buzzer or last vibration.
+// So while the user is dismissing the request through menus (icon still on,
+// buzzer toggling), we don't keep vibrating.
+//
+// Lifecycle:
+//   attention icon off->on: arm vibration, ready to fire on next buzzer-on
+//   buzzer off->on while armed: vibrate, disarm
+//   attention icon on->off: reset (next icon-on will arm again)
+static bool s_buzzer_on = false;          // current buzzer state
+static bool s_prev_attention = false;     // previous attention-icon state
+static bool s_vibe_armed = false;         // ready to vibrate on next buzzer
 
 static void hal_set_frequency(u32_t freq) { } //TODO later for pebbles with speaker?
 static void hal_play_frequency(bool_t en)
 {
-  // Detect edge: only act on off->on transitions, and only if the tama
-  // is signaling a need (attention icon visible).
-  if (en && !s_buzzer_on && s_showingAttentionIcon) {
-    time_t now = time(NULL);
-    if (now - s_last_vibe_ts >= (VIBE_COOLDOWN_MS / 1000)) {
-      vibes_long_pulse();
-      s_last_vibe_ts = now;
-    }
+  // Re-arm if attention icon just appeared (rising edge)
+  if (s_showingAttentionIcon && !s_prev_attention) {
+    s_vibe_armed = true;
+  }
+  // Disarm if attention icon turned off
+  if (!s_showingAttentionIcon && s_prev_attention) {
+    s_vibe_armed = false;
+  }
+  s_prev_attention = s_showingAttentionIcon;
+
+  // Fire on buzzer rising edge if armed
+  if (en && !s_buzzer_on && s_vibe_armed) {
+    vibes_long_pulse();
+    s_vibe_armed = false;
   }
   s_buzzer_on = en;
 }
@@ -661,6 +675,16 @@ static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) 
   }
 }
 
+// Battery indicator: small text at bottom of screen showing percent + charging.
+static void battery_handler(BatteryChargeState state)
+{
+  if (!s_battery_layer) return;
+  snprintf(s_battery_text, sizeof(s_battery_text), "%s%d%%",
+           state.is_charging ? "+" : "",
+           (int)state.charge_percent);
+  text_layer_set_text(s_battery_layer, s_battery_text);
+}
+
 static void main_window_load(Window *window) {
   // Get information about the Window
   Layer *window_layer = window_get_root_layer(window);
@@ -748,12 +772,39 @@ static void main_window_load(Window *window) {
   text_layer_set_overflow_mode(s_text_layer, GTextOverflowModeWordWrap);
   layer_add_child(window_layer, text_layer_get_layer(s_text_layer));
 
+  // Battery indicator: small text below the tama LCD
+#if defined(PBL_PLATFORM_CHALK)
+  s_battery_layer = text_layer_create(GRect(0, 145, 180, 18));
+#elif defined(PBL_PLATFORM_GABBRO)
+  s_battery_layer = text_layer_create(GRect(0, 200, 260, 22));
+#elif defined(PBL_PLATFORM_EMERY)
+  s_battery_layer = text_layer_create(GRect(0, 175, 200, 20));
+#else
+  s_battery_layer = text_layer_create(GRect(0, 140, 144, 18));
+#endif
+  text_layer_set_background_color(s_battery_layer, GColorClear);
+  text_layer_set_text_color(s_battery_layer, GColorBlack);
+  text_layer_set_text_alignment(s_battery_layer, GTextAlignmentCenter);
+  text_layer_set_font(s_battery_layer, fonts_get_system_font(FONT_KEY_GOTHIC_14));
+  layer_add_child(window_layer, text_layer_get_layer(s_battery_layer));
+
+  // Subscribe to battery updates + show initial value
+  battery_state_service_subscribe(battery_handler);
+  battery_handler(battery_state_service_peek());
+
   // Sub to ticks
   milli_tick_handler = app_timer_register(STEP_DELAY, milli_tick, NULL);
   screen_tick_handler = app_timer_register(FPS_DELAY, screen_tick, NULL);
 }
 
 static void main_window_unload(Window *window) {
+  // Unsubscribe battery service
+  battery_state_service_unsubscribe();
+  if (s_battery_layer) {
+    text_layer_destroy(s_battery_layer);
+    s_battery_layer = NULL;
+  }
+
   // Destroy backrgound bitmap and its layer
   gbitmap_destroy(s_bitmap_bg);
   bitmap_layer_destroy(s_background_layer);
