@@ -22,6 +22,7 @@ static void autosave_timer_callback(void *data);
 static void rtc_sync_timer_callback(void *data);
 static bool persistSaveState(void);
 static bool persistLoadState(void);
+static bool loadRomFromResource(void);
 static void autosave_timer_callback(void *data);
 
 static Window *s_main_window;
@@ -437,6 +438,12 @@ static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) 
   Tuple *chunk_t = dict_find(iter, MESSAGE_KEY_ROMChunk);
 
   if(offset_t && chunk_t) {
+    // If we already loaded the ROM locally from resource, ignore phone-sent chunks.
+    // Otherwise tamalib is already running on g_program[] and we'd corrupt it.
+    if (s_hasReceivedRom) {
+      APP_LOG(APP_LOG_LEVEL_DEBUG, "Ignoring ROM chunk (already have local ROM)");
+      return;
+    }
     APP_LOG(APP_LOG_LEVEL_DEBUG, "chunk received");
     int offset = offset_t->value->int16;
     uint8_t *chunk = chunk_t->value->data;
@@ -522,16 +529,22 @@ static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) 
 
   if(STATEnone_t)
   {
-    s_clearTextLayerOnScreenRefresh = true;
-    initTamalib();
+    // If we already booted from local resources, ignore the "no save" signal
+    // from phone — we already started up just fine.
+    if (s_hasReceivedSaveFile) {
+      APP_LOG(APP_LOG_LEVEL_DEBUG, "Ignoring STATEnone (already running)");
+    } else {
+      s_clearTextLayerOnScreenRefresh = true;
+      initTamalib();
+    }
   }
 
   if (STATEpc_t && STATEmemory_t) // assume whole block
   {
-    if (s_loadedFromPersist) {
-      // We already loaded from local persist storage. Ignore the
-      // (potentially older) JS-side state to avoid overwriting good data.
-      APP_LOG(APP_LOG_LEVEL_INFO, "Ignoring JS state (already loaded from persist)");
+    if (s_loadedFromPersist || s_hasReceivedSaveFile) {
+      // We already booted (from persist or just running fresh from resource).
+      // Ignore the JS-side state to avoid overwriting good data.
+      APP_LOG(APP_LOG_LEVEL_INFO, "Ignoring JS state (already running)");
       return;
     }
 
@@ -810,6 +823,31 @@ static void init() {
   // Show the Window on the watch, with animated=true
   window_stack_push(s_main_window, true);
 
+  // Try to bring the emulator up entirely from local data — no phone needed.
+  // Step 1: ROM from app resource (always present, baked at build time).
+  // Step 2: state from persist storage (only present if user has played before).
+  // If both succeed, we're playing immediately even without a phone connection.
+  if (loadRomFromResource()) {
+    s_hasReceivedRom = true;
+    s_clearTextLayerOnScreenRefresh = true;
+
+    if (persistLoadState()) {
+      APP_LOG(APP_LOG_LEVEL_INFO, "Local boot: ROM + persist state loaded");
+      s_hasReceivedSaveFile = true;
+      s_loadedFromPersist = true;
+      initTamalib();
+    } else {
+      // ROM is here but no save yet — start a fresh tama
+      APP_LOG(APP_LOG_LEVEL_INFO, "Local boot: ROM loaded, no persist state -> fresh start");
+      initTamalib();  // initTamalib checks s_hasReceivedSaveFile internally
+    }
+  } else {
+    // Resource load failed — keep classic phone-driven boot path as fallback.
+    // This keeps the watchapp working on a build that someone forgot to
+    // include the ROM in.
+    APP_LOG(APP_LOG_LEVEL_WARNING, "No local ROM resource — falling back to phone");
+  }
+
   // Open AppMessage connection
   app_message_register_inbox_received(prv_inbox_received_handler);
   //app_message_open(256, 128); 
@@ -912,6 +950,51 @@ static void saveCurrentState(bool isAutoSave)
 static void saveCurrentStateAndQuit()
 {
   saveCurrentState(false);
+}
+
+// Load ROM from app resource (built-in, no phone needed).
+// Returns true on success.
+static bool loadRomFromResource(void)
+{
+  ResHandle handle = resource_get_handle(RESOURCE_ID_TAMA_ROM);
+  if (!handle) {
+    APP_LOG(APP_LOG_LEVEL_WARNING, "loadRomFromResource: no resource handle");
+    return false;
+  }
+
+  size_t res_size = resource_size(handle);
+  const size_t expected = 6144 * 2;  // 6144 u12 values, packed as 2 bytes each
+  if (res_size != expected) {
+    APP_LOG(APP_LOG_LEVEL_ERROR, "loadRomFromResource: size %d != expected %d",
+            (int)res_size, (int)expected);
+    return false;
+  }
+
+  // Read into a temporary byte buffer on the heap (12 KB stays off the stack)
+  uint8_t *buf = malloc(res_size);
+  if (!buf) {
+    APP_LOG(APP_LOG_LEVEL_ERROR, "loadRomFromResource: malloc failed");
+    return false;
+  }
+
+  size_t read = resource_load(handle, buf, res_size);
+  if (read != res_size) {
+    APP_LOG(APP_LOG_LEVEL_ERROR, "loadRomFromResource: read %d != expected %d",
+            (int)read, (int)res_size);
+    free(buf);
+    return false;
+  }
+
+  // Unpack: 2 bytes per 12-bit value, low byte first.
+  // Same format as the JS-chunked-ROM-receive path.
+  for (int i = 0; i < 6144; i++) {
+    u12_t value = buf[i * 2] | (buf[i * 2 + 1] << 8);
+    g_program[i] = value & 0x0FFF;  // ensure 12-bit
+  }
+
+  free(buf);
+  APP_LOG(APP_LOG_LEVEL_INFO, "loadRomFromResource: ROM loaded (%d bytes)", (int)res_size);
+  return true;
 }
 
 // Save current state to local watch storage (persist API). Synchronous,
