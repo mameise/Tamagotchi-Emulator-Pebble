@@ -33,6 +33,10 @@ static Layer *s_icons_layer;
 static TextLayer *s_text_layer;
 static TextLayer *s_battery_layer = NULL;
 static char s_battery_text[8] = "";
+static TextLayer *s_time_layer = NULL;
+static char s_time_text[8] = "";
+static TextLayer *s_date_layer = NULL;
+static char s_date_text[16] = "";
 //static GFont s_lcd_font;
 
 // Bitmaps
@@ -675,6 +679,34 @@ static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) 
   }
 }
 
+// Time + date indicators in the watch frame area (above and below the tama LCD).
+// Updated via AppTimer every 30s — safe and doesn't reintroduce the
+// tick_timer_service issue we had earlier.
+static AppTimer *s_clock_timer = NULL;
+
+static void update_clock_text(void)
+{
+  if (!s_time_layer || !s_date_layer) return;
+  time_t now = time(NULL);
+  struct tm *t = localtime(&now);
+  if (!t) return;
+
+  // Time: HH:MM (24h)
+  strftime(s_time_text, sizeof(s_time_text), "%H:%M", t);
+  text_layer_set_text(s_time_layer, s_time_text);
+
+  // Date: e.g. "Mo 21.05"
+  strftime(s_date_text, sizeof(s_date_text), "%a %d.%m", t);
+  text_layer_set_text(s_date_layer, s_date_text);
+}
+
+static void clock_timer_callback(void *data)
+{
+  s_clock_timer = NULL;
+  update_clock_text();
+  s_clock_timer = app_timer_register(30 * 1000, clock_timer_callback, NULL);
+}
+
 // Battery indicator: small text at bottom of screen showing percent + charging.
 static void battery_handler(BatteryChargeState state)
 {
@@ -772,34 +804,51 @@ static void main_window_load(Window *window) {
   text_layer_set_overflow_mode(s_text_layer, GTextOverflowModeWordWrap);
   layer_add_child(window_layer, text_layer_get_layer(s_text_layer));
 
-  // Battery indicator: top-right corner on the watch frame (not over the tama LCD).
-  // Larger font, white text so it's clearly visible against the dark background.
-#if defined(PBL_PLATFORM_CHALK)
-  // Round 180x180 — top-center works better than corner on round watches
-  s_battery_layer = text_layer_create(GRect(60, 8, 60, 24));
-#elif defined(PBL_PLATFORM_GABBRO)
-  // Pebble Time 2: 260x260. Tama LCD at y=92-172. Top-right above the frame.
-  s_battery_layer = text_layer_create(GRect(165, 15, 85, 28));
-#elif defined(PBL_PLATFORM_EMERY)
-  // 200x228. Top-right above tama LCD (which starts ~y=76).
-  s_battery_layer = text_layer_create(GRect(120, 10, 75, 24));
-#else
-  // 144x168 (Diorite/Basalt). Top-right above tama LCD (which starts y=51).
-  s_battery_layer = text_layer_create(GRect(85, 6, 55, 22));
-#endif
-  text_layer_set_background_color(s_battery_layer, GColorClear);
-  text_layer_set_text_color(s_battery_layer, GColorWhite);
-  text_layer_set_text_alignment(s_battery_layer, GTextAlignmentRight);
-#if defined(PBL_PLATFORM_GABBRO)
-  text_layer_set_font(s_battery_layer, fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD));
-#else
-  text_layer_set_font(s_battery_layer, fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD));
-#endif
-  layer_add_child(window_layer, text_layer_get_layer(s_battery_layer));
+  // Battery (right) + Time (left) at top, Date at bottom — all on the watch frame.
+  // Sizes & positions tuned per platform; weiße fette Schrift gegen dunklen Rahmen.
 
-  // Subscribe to battery updates + show initial value
+#if defined(PBL_PLATFORM_GABBRO)
+  // Pebble Time 2: 260x260, tama LCD at y=92-172
+  s_time_layer    = text_layer_create(GRect(10,  15, 100, 32));
+  s_battery_layer = text_layer_create(GRect(150, 15, 100, 32));
+  s_date_layer    = text_layer_create(GRect(10, 185, 240, 32));
+  GFont big_font = fonts_get_system_font(FONT_KEY_GOTHIC_28_BOLD);
+#elif defined(PBL_PLATFORM_EMERY)
+  // Emery: 200x228, tama LCD at y=76-156
+  s_time_layer    = text_layer_create(GRect(8,  10,  80, 26));
+  s_battery_layer = text_layer_create(GRect(110, 10, 80, 26));
+  s_date_layer    = text_layer_create(GRect(10, 170, 180, 26));
+  GFont big_font = fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD);
+#elif defined(PBL_PLATFORM_CHALK)
+  // Round 180x180 — corners less useful, use top-center / bottom-center
+  s_time_layer    = text_layer_create(GRect(10,   8, 65, 22));
+  s_battery_layer = text_layer_create(GRect(105,  8, 65, 22));
+  s_date_layer    = text_layer_create(GRect(0,  148, 180, 22));
+  GFont big_font = fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD);
+#else
+  // Diorite/Basalt 144x168, tama LCD at y=51-115
+  s_time_layer    = text_layer_create(GRect(4,   4, 60, 22));
+  s_battery_layer = text_layer_create(GRect(80,  4, 60, 22));
+  s_date_layer    = text_layer_create(GRect(0, 135, 144, 22));
+  GFont big_font = fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD);
+#endif
+
+  // Common style for all three
+  TextLayer *infos[3] = { s_time_layer, s_battery_layer, s_date_layer };
+  GTextAlignment alignments[3] = { GTextAlignmentLeft, GTextAlignmentRight, GTextAlignmentCenter };
+  for (int i = 0; i < 3; i++) {
+    text_layer_set_background_color(infos[i], GColorClear);
+    text_layer_set_text_color(infos[i], GColorWhite);
+    text_layer_set_text_alignment(infos[i], alignments[i]);
+    text_layer_set_font(infos[i], big_font);
+    layer_add_child(window_layer, text_layer_get_layer(infos[i]));
+  }
+
+  // Initial values + subscriptions
   battery_state_service_subscribe(battery_handler);
   battery_handler(battery_state_service_peek());
+  update_clock_text();
+  s_clock_timer = app_timer_register(30 * 1000, clock_timer_callback, NULL);
 
   // Sub to ticks
   milli_tick_handler = app_timer_register(STEP_DELAY, milli_tick, NULL);
@@ -807,11 +856,25 @@ static void main_window_load(Window *window) {
 }
 
 static void main_window_unload(Window *window) {
+  // Cancel clock update timer
+  if (s_clock_timer) {
+    app_timer_cancel(s_clock_timer);
+    s_clock_timer = NULL;
+  }
+
   // Unsubscribe battery service
   battery_state_service_unsubscribe();
   if (s_battery_layer) {
     text_layer_destroy(s_battery_layer);
     s_battery_layer = NULL;
+  }
+  if (s_time_layer) {
+    text_layer_destroy(s_time_layer);
+    s_time_layer = NULL;
+  }
+  if (s_date_layer) {
+    text_layer_destroy(s_date_layer);
+    s_date_layer = NULL;
   }
 
   // Destroy backrgound bitmap and its layer
