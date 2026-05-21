@@ -251,6 +251,11 @@
                         "emery",
                         "gabbro"
                     ]
+                },
+                {
+                    "file": "data/tama_p1.bin",
+                    "name": "TAMA_ROM",
+                    "type": "raw"
                 }
             ]
         },
