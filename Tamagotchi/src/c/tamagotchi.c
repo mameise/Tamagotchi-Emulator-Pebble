@@ -64,6 +64,10 @@ static flat_state_t stateToLoad = {0};
 static AppTimer *milli_tick_handler;
 static AppTimer *screen_tick_handler;
 
+// Local boot from app resource + persist storage.
+// Set to 0 to disable and fall back to classic phone-driven boot.
+#define RESOURCE_BOOT_ENABLED 0
+
 // Auto-save: every N minutes, persist state to local watch storage.
 // Uses persist_write_data() — no AppMessage, no phone roundtrip, no xhr.
 // Much more robust than the AppMessage-based save+quit flow.
@@ -770,6 +774,7 @@ static void initTamalib() {
     APP_LOG(APP_LOG_LEVEL_DEBUG, "Save state found. Loading...");
 
     cpu_init_from_state(g_program, &stateToLoad, NULL, 1000000);
+    APP_LOG(APP_LOG_LEVEL_DEBUG, "cpu_init_from_state done");
     set_screen_to_last_state(stateToLoad.memory); 
     APP_LOG(APP_LOG_LEVEL_DEBUG, "Save state loaded!");
   }
@@ -778,6 +783,7 @@ static void initTamalib() {
     APP_LOG(APP_LOG_LEVEL_DEBUG, "No save file");
     s_hasReceivedSaveFile = true;
     tamalib_init(g_program, NULL, 1000000);
+    APP_LOG(APP_LOG_LEVEL_DEBUG, "tamalib_init done");
   }
 
   // Initialer RTC -> Tama Sync (in beiden Pfaden, da cpu_state nun bereit ist)
@@ -856,18 +862,34 @@ static void init() {
   // Show the Window on the watch, with animated=true
   window_stack_push(s_main_window, true);
 
-  // Open AppMessage connection BEFORE attempting local boot, so the
-  // app's communication layer is fully initialized first.
+  // Try to bring the emulator up entirely from local data — no phone needed.
+#if RESOURCE_BOOT_ENABLED
+  if (loadRomFromResource()) {
+    s_hasReceivedRom = true;
+    s_clearTextLayerOnScreenRefresh = true;
+
+    if (persistLoadState()) {
+      APP_LOG(APP_LOG_LEVEL_INFO, "Local boot: ROM + persist state loaded");
+      s_hasReceivedSaveFile = true;
+      s_loadedFromPersist = true;
+      initTamalib();
+    } else {
+      APP_LOG(APP_LOG_LEVEL_INFO, "Local boot: ROM loaded, no persist state -> fresh start");
+      initTamalib();
+    }
+  } else {
+    APP_LOG(APP_LOG_LEVEL_WARNING, "No local ROM resource — falling back to phone");
+  }
+#else
+  APP_LOG(APP_LOG_LEVEL_INFO, "Resource boot disabled — using classic phone-driven boot");
+#endif
+
+  // Open AppMessage connection
   app_message_register_inbox_received(prv_inbox_received_handler);
   app_message_open(2048, 2048);
 
   // Listen for button events
   window_set_click_config_provider(s_main_window, click_config_provider);
-
-  // Defer local boot to after init() returns and the Pebble event loop
-  // is properly running. Schedule a one-shot timer with minimal delay.
-  // The 50ms gives PebbleOS time to settle window/event/message state.
-  app_timer_register(50, local_boot_timer_callback, NULL);
 }
 
 static void saveCurrentState(bool isAutoSave)
