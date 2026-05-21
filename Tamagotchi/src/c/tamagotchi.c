@@ -66,7 +66,7 @@ static AppTimer *screen_tick_handler;
 
 // Local boot from app resource + persist storage.
 // Set to 0 to disable and fall back to classic phone-driven boot.
-#define RESOURCE_BOOT_ENABLED 0
+#define RESOURCE_BOOT_ENABLED 1
 
 // Auto-save: every N minutes, persist state to local watch storage.
 // Uses persist_write_data() — no AppMessage, no phone roundtrip, no xhr.
