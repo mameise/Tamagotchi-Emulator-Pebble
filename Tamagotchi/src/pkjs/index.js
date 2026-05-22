@@ -316,12 +316,6 @@ Pebble.addEventListener('webviewclosed',
         if (messageKeys.VibrationEnabled in dict) {
             settingsMsg['VibrationEnabled'] = dict[messageKeys.VibrationEnabled] ? 1 : 0;
         }
-        if (messageKeys.SoundEnabled in dict) {
-            settingsMsg['SoundEnabled'] = dict[messageKeys.SoundEnabled] ? 1 : 0;
-        }
-        if (messageKeys.SoundVolume in dict) {
-            settingsMsg['SoundVolume'] = parseInt(dict[messageKeys.SoundVolume], 10);
-        }
         if (Object.keys(settingsMsg).length > 0) {
             console.log("Forwarding settings to watch: " + JSON.stringify(settingsMsg));
             Pebble.sendAppMessage(settingsMsg);

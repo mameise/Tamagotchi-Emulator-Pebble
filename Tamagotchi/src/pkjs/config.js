@@ -60,22 +60,6 @@ module.exports = [
       },
       {
         "type": "toggle",
-        "messageKey": "SoundEnabled",
-        "label": "Sound (experimental, Pebble Time 2/Flint only)",
-        "description": "Play short beeps through the watch speaker when the Tama buzzes. Off by default — may be unstable on some firmware versions.",
-        "defaultValue": false
-      },
-      {
-        "type": "slider",
-        "messageKey": "SoundVolume",
-        "label": "Sound volume",
-        "defaultValue": 60,
-        "min": 0,
-        "max": 100,
-        "step": 10
-      },
-      {
-        "type": "toggle",
         "messageKey": "reset_tamagotchi",
         "label": "Reset Tamagotchi on Save",
         "defaultValue": false
