@@ -46,6 +46,20 @@ module.exports = [
       },
       {
         "type": "toggle",
+        "messageKey": "UseEmbeddedRom",
+        "label": "Use embedded ROM",
+        "description": "Boot from the ROM bundled in the app (faster, works without phone). Disable to use the ROM URL from the phone instead.",
+        "defaultValue": true
+      },
+      {
+        "type": "toggle",
+        "messageKey": "VibrationEnabled",
+        "label": "Vibrate on attention",
+        "description": "Watch vibrates when the Tama needs attention (hungry, sick, ...).",
+        "defaultValue": true
+      },
+      {
+        "type": "toggle",
         "messageKey": "reset_tamagotchi",
         "label": "Reset Tamagotchi on Save",
         "defaultValue": false

@@ -268,7 +268,8 @@ Pebble.addEventListener('appmessage', function(e) {
 
     if ('STATEpc' in dict)
     {
-        SaveStateAfterClosingApp(dict);
+        var isAutoSave = dict['AutoSave'] === 1;
+        SaveStateAfterClosingApp(dict, isAutoSave);
     }
   });
 
@@ -306,10 +307,23 @@ Pebble.addEventListener('webviewclosed',
             localStorage.removeItem(LAST_STATE_KEY); // delete save file
             Pebble.sendAppMessage({'reset_tamagotchi': 1}); // tell watch to reset
         }
+
+        // Forward new settings to the watch app so they take effect
+        var settingsMsg = {};
+        if (messageKeys.UseEmbeddedRom in dict) {
+            settingsMsg['UseEmbeddedRom'] = dict[messageKeys.UseEmbeddedRom] ? 1 : 0;
+        }
+        if (messageKeys.VibrationEnabled in dict) {
+            settingsMsg['VibrationEnabled'] = dict[messageKeys.VibrationEnabled] ? 1 : 0;
+        }
+        if (Object.keys(settingsMsg).length > 0) {
+            console.log("Forwarding settings to watch: " + JSON.stringify(settingsMsg));
+            Pebble.sendAppMessage(settingsMsg);
+        }
     }
 );
 
-function SaveStateAfterClosingApp(saveStateDict)
+function SaveStateAfterClosingApp(saveStateDict, isAutoSave)
 {
     //TODO temp
     //saveStateDict = {"STATEpc":26,"STATEx":125,"STATEy":525,"STATEa":0,"STATEb":1,"STATEnp":0,"STATEsp":242,"STATEflags":3,"STATEtick_counter":32674418,"STATEclk_timer_timestamp":32669696,"STATEprog_timer_timestamp":32674396,"STATEprog_timer_enabled":1,"STATEprog_timer_data":3,"STATEprog_timer_rld":7,"STATEcall_depth":3,"STATEinterrupts":[0,1,0,12,0,0,0,10,0,0,0,8,7,0,0,6,0,0,0,4,0,8,0,2],"STATEmemory":[48,0,15,18,136,0,0,0,57,20,20,0,0,0,0,0,0,0,0,0,0,0,0,81,62,174,8,125,6,148,15,12,196,0,0,5,0,240,0,0,0,0,0,16,240,5,16,17,0,1,203,0,20,177,20,21,12,16,15,168,1,240,15,6,1,5,8,0,0,0,0,0,255,28,255,28,29,255,29,255,0,127,80,43,63,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,119,113,23,119,113,23,125,112,23,125,119,1,134,4,216,144,248,46,5,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,60,122,110,110,122,60,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,3,1,255,6,0,0,16,2,51,192,80,31,0,0,0,0,0,0,0,0,0,0,0,0,255,255,3,4,45,192,5,5,60,240,128,17,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,60,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,60,122,110,110,122,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,8,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,4,1,33,0,0,0],"STATEselected_icon":-1,"STATEshowing_attention_icon":0};
@@ -317,9 +331,10 @@ function SaveStateAfterClosingApp(saveStateDict)
     if (saveStateDict.STATEpc === 0 || saveStateDict.STATEmemory[0] === null) return; // don't save bad saves and overwrite
     
     localStorage.setItem(LAST_STATE_KEY, JSON.stringify(saveStateDict));
-    console.log("Saved last state to js localstorage...");
+    console.log("Saved last state to js localstorage... (autosave=" + isAutoSave + ")");
 
-    if(localStorage.getItem(APISERVER_KEY) !== null)
+    var apiServerUrl = localStorage.getItem(APISERVER_KEY);
+    if(apiServerUrl !== null && apiServerUrl.trim().length !== 0)
     {
         console.log("Sending save to server as well...");
         let payload = {
@@ -351,19 +366,25 @@ function SaveStateAfterClosingApp(saveStateDict)
             'showing_attention_icon': saveStateDict.STATEshowing_attention_icon
         };
 
-        xhrRequest(localStorage.getItem(APISERVER_KEY) + "/state", 'POST', payload,
+        xhrRequest(apiServerUrl + "/state", 'POST', payload,
         (responseText) => { // success
             console.log("Successfully sent save state to server: " + responseText);
-            Pebble.sendAppMessage({'JSMessage': "Saved to server!", 'JSFinishedSaving': 1}); // tell watch to finish quitting
+            if (!isAutoSave) {
+                Pebble.sendAppMessage({'JSMessage': "Saved to server!", 'JSFinishedSaving': 1}); // tell watch to finish quitting
+            }
         }, 
         (error, response) => { // fail
             localStorage.setItem(SERVER_SAVE_FAILED_KEY, true); // keep track that this failed!
             console.log("Failed to send data to server. Error: " + error + "Response: " + response);
-            Pebble.sendAppMessage({'JSMessage': "Saving to server failed!", 'JSFinishedSaving': 1}); // tell watch to finish quitting //TODO retry?
+            if (!isAutoSave) {
+                Pebble.sendAppMessage({'JSMessage': "Saving to server failed!", 'JSFinishedSaving': 1}); // tell watch to finish quitting //TODO retry?
+            }
         });
     }
     else
     {
-        Pebble.sendAppMessage({'JSMessage': "Saved!", 'JSFinishedSaving': 1}); // tell watch we saved and it can quit now
+        if (!isAutoSave) {
+            Pebble.sendAppMessage({'JSMessage': "Saved!", 'JSFinishedSaving': 1}); // tell watch we saved and it can quit now
+        }
     }
 }
