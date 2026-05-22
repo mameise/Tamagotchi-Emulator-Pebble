@@ -89,9 +89,28 @@ static uint8_t s_sound_volume   = 70;  // 0-100
 
 // Tama buzzer state — driven by tamalib's hal_set_frequency / hal_play_frequency
 // Note: tamalib calls set_frequency() in deci-Hertz (dHz)! See tamalib/hal.h:75.
-// e.g. value 16384 = 1638.4 Hz. We divide by 10 before passing to Pebble.
-static uint32_t s_tama_freq_dhz = 10000;   // last frequency from tamalib, in dHz
-static bool     s_speaker_playing = false; // whether we currently have a tone going
+static uint32_t s_tama_freq_dhz = 10000;
+static bool     s_speaker_playing = false;
+
+// The Tama emulator toggles the buzzer at very high rates (it uses the toggle
+// itself as PWM to control tone and volume). If we call speaker_play_tone()
+// and speaker_stop() on every toggle we get a click per toggle, not a tone.
+// Instead, we delay the actual speaker_stop() by a small window — if a new
+// "buzzer on" arrives during that window, the speaker keeps playing.
+#define SPEAKER_STOP_DELAY_MS 80
+static AppTimer *s_speaker_stop_timer = NULL;
+
+static void speaker_stop_timer_callback(void *data)
+{
+  s_speaker_stop_timer = NULL;
+#if defined(PBL_SPEAKER)
+  if (s_speaker_playing) {
+    speaker_stop();
+    s_speaker_playing = false;
+    APP_LOG(APP_LOG_LEVEL_DEBUG, "speaker stop (delayed)");
+  }
+#endif
+}
 
 // Auto-save: every N minutes, persist state to local watch storage.
 // Uses persist_write_data() — no AppMessage, no phone roundtrip, no xhr.
@@ -220,21 +239,32 @@ static void hal_play_frequency(bool_t en)
 {
 #if defined(PBL_SPEAKER)
   if (s_sound_enabled) {
-    if (en && !s_speaker_playing) {
-      uint16_t hz = (uint16_t)(s_tama_freq_dhz / 10);
-      if (hz < 50)   hz = 50;
-      if (hz > 8000) hz = 8000;
-
-      bool ok = speaker_play_tone(hz, 10000, s_sound_volume, SpeakerWaveformSquare);
-      APP_LOG(APP_LOG_LEVEL_DEBUG, "speaker start %d Hz vol=%d -> %d",
-              (int)hz, (int)s_sound_volume, (int)ok);
-      if (ok) {
-        s_speaker_playing = true;
+    if (en) {
+      // Cancel any pending stop — buzzer is on again, keep playing
+      if (s_speaker_stop_timer) {
+        app_timer_cancel(s_speaker_stop_timer);
+        s_speaker_stop_timer = NULL;
       }
-    } else if (!en && s_speaker_playing) {
-      APP_LOG(APP_LOG_LEVEL_DEBUG, "speaker stop");
-      speaker_stop();
-      s_speaker_playing = false;
+
+      if (!s_speaker_playing) {
+        uint16_t hz = (uint16_t)(s_tama_freq_dhz / 10);
+        if (hz < 50)   hz = 50;
+        if (hz > 8000) hz = 8000;
+
+        bool ok = speaker_play_tone(hz, 10000, s_sound_volume, SpeakerWaveformSquare);
+        APP_LOG(APP_LOG_LEVEL_DEBUG, "speaker start %d Hz vol=%d -> %d",
+                (int)hz, (int)s_sound_volume, (int)ok);
+        if (ok) {
+          s_speaker_playing = true;
+        }
+      }
+    } else {
+      // Don't stop immediately — schedule a delayed stop. If buzzer comes
+      // back on within SPEAKER_STOP_DELAY_MS, we cancel and keep playing.
+      if (s_speaker_playing && !s_speaker_stop_timer) {
+        s_speaker_stop_timer = app_timer_register(
+            SPEAKER_STOP_DELAY_MS, speaker_stop_timer_callback, NULL);
+      }
     }
   }
 #endif
@@ -1507,6 +1537,10 @@ static void deinit() {
   }
 
   // Make sure the speaker doesn't keep humming after exit
+  if (s_speaker_stop_timer) {
+    app_timer_cancel(s_speaker_stop_timer);
+    s_speaker_stop_timer = NULL;
+  }
 #if defined(PBL_SPEAKER)
   speaker_stop();
 #endif
