@@ -1,3 +1,15 @@
+Fork of the Tamagotchi Emulator 4 Pebble with following changes:
+- added auto sync of the time on start and all 2 hours if drift is above 30 seconds
+- autosave all 5 minutes
+- support for tama-p1.bin to have it on the watch, no need to load rom from watch on start anymore
+- added time, battery status and date on the frame around the tamagotchi screen
+- some small fix to avoid auto close when idle
+
+- to do: upload script to modify tama-p1.bin that are found all around the internet to be compatible
+
+- Note: bin file needs to be put into resources/data folder, not provided here in this repo!
+
+
 # Tamagotchi Emulator 4 Pebble
 Tamagotchi P1/P2 emulator for the Pebble watch, created for the Spring 2026 Pebble Contest.
 Powered by [TamaLib](https://github.com/jcrona/tamalib/).
