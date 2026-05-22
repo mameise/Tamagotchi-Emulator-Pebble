@@ -46,9 +46,7 @@
             "JSFinishedSaving",
             "AutoSave",
             "UseEmbeddedRom",
-            "VibrationEnabled",
-            "SoundEnabled",
-            "SoundVolume"
+            "VibrationEnabled"
         ],
         "projectType": "native",
         "resources": {
