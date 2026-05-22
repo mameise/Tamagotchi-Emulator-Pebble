@@ -88,7 +88,10 @@ static bool s_sound_enabled     = true;
 static uint8_t s_sound_volume   = 70;  // 0-100
 
 // Tama buzzer state — driven by tamalib's hal_set_frequency / hal_play_frequency
-static uint32_t s_tama_freq_hz = 1000;  // last frequency requested by tamalib
+// Note: tamalib calls set_frequency() in deci-Hertz (dHz)! See tamalib/hal.h:75.
+// e.g. value 16384 = 1638.4 Hz. We divide by 10 before passing to Pebble.
+static uint32_t s_tama_freq_dhz = 10000;   // last frequency from tamalib, in dHz
+static bool     s_speaker_playing = false; // whether we currently have a tone going
 
 // Auto-save: every N minutes, persist state to local watch storage.
 // Uses persist_write_data() — no AppMessage, no phone roundtrip, no xhr.
@@ -196,33 +199,50 @@ static bool s_vibe_armed = false;         // ready to vibrate on next buzzer
 
 static void hal_set_frequency(u32_t freq)
 {
-  // Remember the frequency tamalib wants. We can't pre-set it on Pebble;
-  // we'll use it the next time hal_play_frequency(true) fires.
-  if (freq > 0) {
-    s_tama_freq_hz = freq;
+  // tamalib uses deci-Hertz (1638.4 Hz = value 16384). Just store it; we
+  // convert when actually calling the speaker API.
+  if (freq == 0) return;
+
+  // If the frequency changed and a tone is currently playing, retrigger
+  // so the new pitch takes effect immediately.
+#if defined(PBL_SPEAKER)
+  if (s_speaker_playing && s_sound_enabled && freq != s_tama_freq_dhz) {
+    uint16_t hz = (uint16_t)(freq / 10);
+    if (hz < 50)   hz = 50;     // clamp to audible range
+    if (hz > 8000) hz = 8000;
+    speaker_stop();
+    speaker_play_tone(hz, 10000, s_sound_volume, SpeakerWaveformSquare);
   }
+#endif
+
+  s_tama_freq_dhz = freq;
 }
 
 static void hal_play_frequency(bool_t en)
 {
-  // --- Sound output via Pebble Speaker API (Pebble Time 2 / Emery / Flint) ---
+  // --- Sound output via Pebble Speaker API ---
 #if defined(PBL_SPEAKER)
   if (s_sound_enabled) {
-    if (en) {
-      // Stop any previous tone first, then start a fresh one.
-      // We use 200ms as a "this will be re-triggered if the buzzer stays on" duration;
-      // tamalib typically toggles much faster than this for melodies.
+    if (en && !s_speaker_playing) {
+      // Convert dHz -> Hz, clamp to audible/safe range
+      uint16_t hz = (uint16_t)(s_tama_freq_dhz / 10);
+      if (hz < 50)   hz = 50;
+      if (hz > 8000) hz = 8000;
+
+      // Long duration (10s max per docs); we'll cut it off ourselves when
+      // tamalib calls play_frequency(false). This avoids per-cycle setup
+      // clicks from the speaker driver.
+      if (speaker_play_tone(hz, 10000, s_sound_volume, SpeakerWaveformSquare)) {
+        s_speaker_playing = true;
+      }
+    } else if (!en && s_speaker_playing) {
       speaker_stop();
-      speaker_play_tone((uint16_t)s_tama_freq_hz, 200, s_sound_volume,
-                        SpeakerWaveformSquare);  // square = retro Tama feel
-    } else {
-      speaker_stop();
+      s_speaker_playing = false;
     }
   }
 #endif
 
   // --- Vibration on attention (independent of sound) ---
-  // Re-arm if attention icon just appeared (rising edge)
   if (s_showingAttentionIcon && !s_prev_attention) {
     s_vibe_armed = true;
   }
@@ -231,7 +251,6 @@ static void hal_play_frequency(bool_t en)
   }
   s_prev_attention = s_showingAttentionIcon;
 
-  // Fire on buzzer rising edge if armed AND vibration is enabled by user
   if (en && !s_buzzer_on && s_vibe_armed && s_vibration_enabled) {
     vibes_long_pulse();
     s_vibe_armed = false;
@@ -1489,6 +1508,12 @@ static void deinit() {
     app_timer_cancel(s_rtc_sync_timer);
     s_rtc_sync_timer = NULL;
   }
+
+  // Make sure the speaker doesn't keep humming after exit
+#if defined(PBL_SPEAKER)
+  speaker_stop();
+#endif
+
   window_destroy(s_main_window);
 
   // Release tamalib
