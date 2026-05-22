@@ -88,7 +88,18 @@ static bool s_sound_enabled     = false;  // OFF by default — opt-in feature
 static uint8_t s_sound_volume   = 60;
 
 // Tama buzzer state. tamalib uses deci-Hertz (dHz). See tamalib/hal.h:75.
+//
+// IMPORTANT: We do NOT call speaker_play_tone() from hal_play_frequency,
+// because that runs from deep inside the tamalib emulator loop (which itself
+// runs from milli_tick AppTimer). Calling the speaker API from that context
+// has caused hard watch resets.
+//
+// Instead, hal_play_frequency only sets a "pending beep" flag, and the
+// regular screen_tick handler (which runs as a normal UI tick, not nested
+// inside emulator code) picks it up and triggers the actual sound.
 static uint32_t s_tama_freq_dhz = 10000;
+static bool     s_beep_pending  = false;
+static uint16_t s_beep_freq_hz  = 1000;
 static uint32_t s_last_tone_ms  = 0;
 
 // Auto-save: every N minutes, persist state to local watch storage.
@@ -204,21 +215,15 @@ static void hal_set_frequency(u32_t freq)
 
 static void hal_play_frequency(bool_t en)
 {
-  // --- Sound: minimal direct call, no state tracking, no stop/restart pairs.
-  // Just fire a short tone on rising edge. Throttle to avoid hammering the
-  // speaker API during rapid buzzer toggles from tamalib.
-#if defined(PBL_SPEAKER)
+  // --- Sound: just flag a pending beep. Actual speaker call happens in
+  // screen_tick handler to avoid calling speaker API from emulator context.
   if (s_sound_enabled && en && !s_buzzer_on) {
-    uint32_t now_ms = time_ms(NULL, NULL);
-    if (now_ms - s_last_tone_ms >= 200) {  // min gap between tones
-      uint16_t hz = (uint16_t)(s_tama_freq_dhz / 10);
-      if (hz < 100)  hz = 100;
-      if (hz > 4000) hz = 4000;
-      speaker_play_tone(hz, 150, s_sound_volume, SpeakerWaveformSquare);
-      s_last_tone_ms = now_ms;
-    }
+    uint16_t hz = (uint16_t)(s_tama_freq_dhz / 10);
+    if (hz < 100)  hz = 100;
+    if (hz > 4000) hz = 4000;
+    s_beep_freq_hz = hz;
+    s_beep_pending = true;
   }
-#endif
 
   // --- Vibration: attention-icon-anchored, same as before
   if (s_showingAttentionIcon && !s_prev_attention) {
@@ -340,6 +345,23 @@ static void screen_tick() // runs every 33 ms for about 30fps
     Message(" ");
     layer_set_hidden((Layer *)s_screen_layer, false); // unhide screen layer
   }
+
+  // Process any pending beep from tamalib (set via hal_play_frequency).
+  // This runs in the screen tick's "normal" UI context, NOT nested
+  // inside tamalib_step, which makes speaker_play_tone() much safer.
+#if defined(PBL_SPEAKER)
+  if (s_beep_pending) {
+    s_beep_pending = false;
+    if (s_sound_enabled) {
+      uint32_t now_ms = time_ms(NULL, NULL);
+      if (now_ms - s_last_tone_ms >= 200) {
+        speaker_play_tone(s_beep_freq_hz, 150, s_sound_volume, SpeakerWaveformSquare);
+        s_last_tone_ms = now_ms;
+      }
+    }
+  }
+#endif
+
   screen_tick_handler = app_timer_register(FPS_DELAY, screen_tick, NULL);
 }
 
