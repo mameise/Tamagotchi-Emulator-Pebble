@@ -60,22 +60,6 @@ module.exports = [
       },
       {
         "type": "toggle",
-        "messageKey": "SoundEnabled",
-        "label": "Sound (Pebble Time 2 and Flint only)",
-        "description": "Play the Tamagotchi's beeps and tunes through the watch speaker. Requires a watch with a built-in speaker.",
-        "defaultValue": true
-      },
-      {
-        "type": "slider",
-        "messageKey": "SoundVolume",
-        "label": "Sound volume",
-        "defaultValue": 70,
-        "min": 0,
-        "max": 100,
-        "step": 10
-      },
-      {
-        "type": "toggle",
         "messageKey": "reset_tamagotchi",
         "label": "Reset Tamagotchi on Save",
         "defaultValue": false
