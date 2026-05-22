@@ -44,7 +44,9 @@
             "JSMessage",
             "reset_tamagotchi",
             "JSFinishedSaving",
-            "AutoSave"
+            "AutoSave",
+            "UseEmbeddedRom",
+            "VibrationEnabled"
         ],
         "projectType": "native",
         "resources": {
