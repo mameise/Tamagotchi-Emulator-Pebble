@@ -23,6 +23,7 @@ static void rtc_sync_timer_callback(void *data);
 static bool persistSaveState(void);
 static bool persistLoadState(void);
 static bool loadRomFromResource(void);
+static void loadSettingsFromPersist(void);
 static void local_boot_timer_callback(void *data);
 static void autosave_timer_callback(void *data);
 
@@ -71,8 +72,16 @@ static AppTimer *milli_tick_handler;
 static AppTimer *screen_tick_handler;
 
 // Local boot from app resource + persist storage.
-// Set to 0 to disable and fall back to classic phone-driven boot.
+// This default can be overridden at runtime via settings.
 #define RESOURCE_BOOT_ENABLED 1
+
+// Persistent settings keys (separate from save-state keys)
+#define PERSIST_KEY_USE_EMBEDDED_ROM  200
+#define PERSIST_KEY_VIBRATION_ENABLED 201
+
+// Runtime settings — loaded from persist on startup, updated from Clay config.
+static bool s_use_embedded_rom  = true;
+static bool s_vibration_enabled = true;
 
 // Auto-save: every N minutes, persist state to local watch storage.
 // Uses persist_write_data() — no AppMessage, no phone roundtrip, no xhr.
@@ -191,8 +200,8 @@ static void hal_play_frequency(bool_t en)
   }
   s_prev_attention = s_showingAttentionIcon;
 
-  // Fire on buzzer rising edge if armed
-  if (en && !s_buzzer_on && s_vibe_armed) {
+  // Fire on buzzer rising edge if armed AND vibration is enabled by user
+  if (en && !s_buzzer_on && s_vibe_armed && s_vibration_enabled) {
     vibes_long_pulse();
     s_vibe_armed = false;
   }
@@ -480,6 +489,22 @@ static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) 
       s_hasReceivedSaveFile = false;
       initTamalib();
     }
+  }
+
+  // Settings updates from Clay
+  Tuple *use_embedded_rom_t = dict_find(iter, MESSAGE_KEY_UseEmbeddedRom);
+  if (use_embedded_rom_t) {
+    bool v = (use_embedded_rom_t->value->int32 != 0);
+    s_use_embedded_rom = v;
+    persist_write_bool(PERSIST_KEY_USE_EMBEDDED_ROM, v);
+    APP_LOG(APP_LOG_LEVEL_INFO, "Settings: UseEmbeddedRom = %d (takes effect next start)", (int)v);
+  }
+  Tuple *vibration_enabled_t = dict_find(iter, MESSAGE_KEY_VibrationEnabled);
+  if (vibration_enabled_t) {
+    bool v = (vibration_enabled_t->value->int32 != 0);
+    s_vibration_enabled = v;
+    persist_write_bool(PERSIST_KEY_VIBRATION_ENABLED, v);
+    APP_LOG(APP_LOG_LEVEL_INFO, "Settings: VibrationEnabled = %d", (int)v);
   }
   
 
@@ -1015,27 +1040,30 @@ static void init() {
   // Show the Window on the watch, with animated=true
   window_stack_push(s_main_window, true);
 
-  // Try to bring the emulator up entirely from local data — no phone needed.
-#if RESOURCE_BOOT_ENABLED
-  if (loadRomFromResource()) {
-    s_hasReceivedRom = true;
-    s_clearTextLayerOnScreenRefresh = true;
+  // Load user settings from persist before anything that depends on them
+  loadSettingsFromPersist();
 
-    if (persistLoadState()) {
-      APP_LOG(APP_LOG_LEVEL_INFO, "Local boot: ROM + persist state loaded");
-      s_hasReceivedSaveFile = true;
-      s_loadedFromPersist = true;
-      initTamalib();
+  // Try local boot if enabled by user setting (default: on)
+  if (s_use_embedded_rom) {
+    if (loadRomFromResource()) {
+      s_hasReceivedRom = true;
+      s_clearTextLayerOnScreenRefresh = true;
+
+      if (persistLoadState()) {
+        APP_LOG(APP_LOG_LEVEL_INFO, "Local boot: ROM + persist state loaded");
+        s_hasReceivedSaveFile = true;
+        s_loadedFromPersist = true;
+        initTamalib();
+      } else {
+        APP_LOG(APP_LOG_LEVEL_INFO, "Local boot: ROM loaded, no persist state -> fresh start");
+        initTamalib();
+      }
     } else {
-      APP_LOG(APP_LOG_LEVEL_INFO, "Local boot: ROM loaded, no persist state -> fresh start");
-      initTamalib();
+      APP_LOG(APP_LOG_LEVEL_WARNING, "No local ROM resource — falling back to phone");
     }
   } else {
-    APP_LOG(APP_LOG_LEVEL_WARNING, "No local ROM resource — falling back to phone");
+    APP_LOG(APP_LOG_LEVEL_INFO, "Embedded ROM disabled by setting — using phone-driven boot");
   }
-#else
-  APP_LOG(APP_LOG_LEVEL_INFO, "Resource boot disabled — using classic phone-driven boot");
-#endif
 
   // Open AppMessage connection
   app_message_register_inbox_received(prv_inbox_received_handler);
@@ -1183,6 +1211,19 @@ static bool loadRomFromResource(void)
   free(buf);
   APP_LOG(APP_LOG_LEVEL_INFO, "loadRomFromResource: ROM loaded (%d bytes)", (int)res_size);
   return true;
+}
+
+// Load settings from persist (with safe defaults if no values stored)
+static void loadSettingsFromPersist(void)
+{
+  if (persist_exists(PERSIST_KEY_USE_EMBEDDED_ROM)) {
+    s_use_embedded_rom = persist_read_bool(PERSIST_KEY_USE_EMBEDDED_ROM);
+  }
+  if (persist_exists(PERSIST_KEY_VIBRATION_ENABLED)) {
+    s_vibration_enabled = persist_read_bool(PERSIST_KEY_VIBRATION_ENABLED);
+  }
+  APP_LOG(APP_LOG_LEVEL_INFO, "Settings: embedded_rom=%d vibration=%d",
+          (int)s_use_embedded_rom, (int)s_vibration_enabled);
 }
 
 // Save current state to local watch storage (persist API). Synchronous,
