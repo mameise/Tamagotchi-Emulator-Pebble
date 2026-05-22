@@ -89,30 +89,17 @@ static uint8_t s_sound_volume   = 70;  // 0-100
 
 // Tama buzzer state — driven by tamalib's hal_set_frequency / hal_play_frequency
 // Note: tamalib calls set_frequency() in deci-Hertz (dHz)! See tamalib/hal.h:75.
+//
+// Why we don't track the buzzer continuously: the Tama emulator toggles
+// hal_play_frequency() at very high rates (multiple times per second for
+// each beep), and the Pebble speaker API isn't designed for that — it
+// crashes the audio subsystem under rapid play_tone() / stop() pairs.
+//
+// Instead we use the attention-icon-rising-edge as a single trigger:
+// when the Tama starts asking for attention, we play ONE short beep.
+// Menu beeps and other internal sounds are skipped, which is the safe
+// trade-off.
 static uint32_t s_tama_freq_dhz = 10000;
-static bool     s_speaker_playing = false;
-
-// Debounce: don't actually stop the speaker for SPEAKER_STOP_DELAY_MS after
-// the buzzer goes off. This avoids click-per-toggle when the Tama produces
-// short menu beeps in rapid succession.
-#define SPEAKER_STOP_DELAY_MS 80
-
-// Throttle: don't try to start a new tone more often than this. Some Pebble
-// audio stacks can crash if play_tone() is hammered with no time in between.
-#define SPEAKER_MIN_RESTART_MS 30
-static AppTimer *s_speaker_stop_timer = NULL;
-static uint32_t s_last_speaker_start_tick = 0;
-
-static void speaker_stop_timer_callback(void *data)
-{
-  s_speaker_stop_timer = NULL;
-#if defined(PBL_SPEAKER)
-  if (s_speaker_playing) {
-    speaker_stop();
-    s_speaker_playing = false;
-  }
-#endif
-}
 
 // Auto-save: every N minutes, persist state to local watch storage.
 // Uses persist_write_data() — no AppMessage, no phone roundtrip, no xhr.
@@ -230,48 +217,7 @@ static void hal_set_frequency(u32_t freq)
 
 static void hal_play_frequency(bool_t en)
 {
-#if defined(PBL_SPEAKER)
-  if (s_sound_enabled) {
-    if (en) {
-      // Cancel any pending stop — buzzer is on again, keep playing
-      if (s_speaker_stop_timer) {
-        app_timer_cancel(s_speaker_stop_timer);
-        s_speaker_stop_timer = NULL;
-      }
-
-      if (!s_speaker_playing) {
-        // Throttle: don't restart the speaker faster than SPEAKER_MIN_RESTART_MS.
-        // Rapid play_tone() calls have been observed to crash the audio stack.
-        uint32_t now_ms = time_ms(NULL, NULL);
-        if (now_ms - s_last_speaker_start_tick < SPEAKER_MIN_RESTART_MS) {
-          // Too soon — skip this start. Tamalib will toggle the buzzer again
-          // very soon anyway.
-          goto vibe_check;
-        }
-
-        uint16_t hz = (uint16_t)(s_tama_freq_dhz / 10);
-        if (hz < 50)   hz = 50;
-        if (hz > 8000) hz = 8000;
-
-        if (speaker_play_tone(hz, 10000, s_sound_volume, SpeakerWaveformSquare)) {
-          s_speaker_playing = true;
-          s_last_speaker_start_tick = now_ms;
-        }
-      }
-    } else {
-      // Schedule a delayed stop. If buzzer comes back on within
-      // SPEAKER_STOP_DELAY_MS, the timer is cancelled and the speaker
-      // keeps playing.
-      if (s_speaker_playing && !s_speaker_stop_timer) {
-        s_speaker_stop_timer = app_timer_register(
-            SPEAKER_STOP_DELAY_MS, speaker_stop_timer_callback, NULL);
-      }
-    }
-  }
-vibe_check:;
-#endif
-
-  // --- Vibration on attention (independent of sound) ---
+  // --- Attention trigger: arm on rising edge, disarm on falling ---
   if (s_showingAttentionIcon && !s_prev_attention) {
     s_vibe_armed = true;
   }
@@ -280,10 +226,23 @@ vibe_check:;
   }
   s_prev_attention = s_showingAttentionIcon;
 
-  if (en && !s_buzzer_on && s_vibe_armed && s_vibration_enabled) {
-    vibes_long_pulse();
+  // Only fire on buzzer rising edge, when armed (= attention just started)
+  if (en && !s_buzzer_on && s_vibe_armed) {
+    if (s_vibration_enabled) {
+      vibes_long_pulse();
+    }
+#if defined(PBL_SPEAKER)
+    if (s_sound_enabled) {
+      // One short beep (300ms) at the current Tama frequency
+      uint16_t hz = (uint16_t)(s_tama_freq_dhz / 10);
+      if (hz < 50)   hz = 50;
+      if (hz > 8000) hz = 8000;
+      speaker_play_tone(hz, 300, s_sound_volume, SpeakerWaveformSquare);
+    }
+#endif
     s_vibe_armed = false;
   }
+
   s_buzzer_on = en;
 }
 
@@ -602,9 +561,6 @@ static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) 
     s_sound_volume = (uint8_t)v;
     persist_write_int(PERSIST_KEY_SOUND_VOLUME, v);
     APP_LOG(APP_LOG_LEVEL_INFO, "Settings: SoundVolume = %d", v);
-#if defined(PBL_SPEAKER)
-    speaker_set_volume(s_sound_volume);
-#endif
   }
   
 
@@ -1539,10 +1495,6 @@ static void deinit() {
   }
 
   // Make sure the speaker doesn't keep humming after exit
-  if (s_speaker_stop_timer) {
-    app_timer_cancel(s_speaker_stop_timer);
-    s_speaker_stop_timer = NULL;
-  }
 #if defined(PBL_SPEAKER)
   speaker_stop();
 #endif
