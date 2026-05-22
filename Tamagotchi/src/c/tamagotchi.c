@@ -78,10 +78,17 @@ static AppTimer *screen_tick_handler;
 // Persistent settings keys (separate from save-state keys)
 #define PERSIST_KEY_USE_EMBEDDED_ROM  200
 #define PERSIST_KEY_VIBRATION_ENABLED 201
+#define PERSIST_KEY_SOUND_ENABLED     202
+#define PERSIST_KEY_SOUND_VOLUME      203
 
 // Runtime settings — loaded from persist on startup, updated from Clay config.
 static bool s_use_embedded_rom  = true;
 static bool s_vibration_enabled = true;
+static bool s_sound_enabled     = true;
+static uint8_t s_sound_volume   = 70;  // 0-100
+
+// Tama buzzer state — driven by tamalib's hal_set_frequency / hal_play_frequency
+static uint32_t s_tama_freq_hz = 1000;  // last frequency requested by tamalib
 
 // Auto-save: every N minutes, persist state to local watch storage.
 // Uses persist_write_data() — no AppMessage, no phone roundtrip, no xhr.
@@ -187,14 +194,38 @@ static bool s_buzzer_on = false;          // current buzzer state
 static bool s_prev_attention = false;     // previous attention-icon state
 static bool s_vibe_armed = false;         // ready to vibrate on next buzzer
 
-static void hal_set_frequency(u32_t freq) { } //TODO later for pebbles with speaker?
+static void hal_set_frequency(u32_t freq)
+{
+  // Remember the frequency tamalib wants. We can't pre-set it on Pebble;
+  // we'll use it the next time hal_play_frequency(true) fires.
+  if (freq > 0) {
+    s_tama_freq_hz = freq;
+  }
+}
+
 static void hal_play_frequency(bool_t en)
 {
+  // --- Sound output via Pebble Speaker API (Pebble Time 2 / Emery / Flint) ---
+#if defined(PBL_SPEAKER)
+  if (s_sound_enabled) {
+    if (en) {
+      // Stop any previous tone first, then start a fresh one.
+      // We use 200ms as a "this will be re-triggered if the buzzer stays on" duration;
+      // tamalib typically toggles much faster than this for melodies.
+      speaker_stop();
+      speaker_play_tone((uint16_t)s_tama_freq_hz, 200, s_sound_volume,
+                        SpeakerWaveformSquare);  // square = retro Tama feel
+    } else {
+      speaker_stop();
+    }
+  }
+#endif
+
+  // --- Vibration on attention (independent of sound) ---
   // Re-arm if attention icon just appeared (rising edge)
   if (s_showingAttentionIcon && !s_prev_attention) {
     s_vibe_armed = true;
   }
-  // Disarm if attention icon turned off
   if (!s_showingAttentionIcon && s_prev_attention) {
     s_vibe_armed = false;
   }
@@ -505,6 +536,27 @@ static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) 
     s_vibration_enabled = v;
     persist_write_bool(PERSIST_KEY_VIBRATION_ENABLED, v);
     APP_LOG(APP_LOG_LEVEL_INFO, "Settings: VibrationEnabled = %d", (int)v);
+  }
+  Tuple *sound_enabled_t = dict_find(iter, MESSAGE_KEY_SoundEnabled);
+  if (sound_enabled_t) {
+    bool v = (sound_enabled_t->value->int32 != 0);
+    s_sound_enabled = v;
+    persist_write_bool(PERSIST_KEY_SOUND_ENABLED, v);
+    APP_LOG(APP_LOG_LEVEL_INFO, "Settings: SoundEnabled = %d", (int)v);
+#if defined(PBL_SPEAKER)
+    if (!v) speaker_stop();  // stop immediately if user turned it off
+#endif
+  }
+  Tuple *sound_volume_t = dict_find(iter, MESSAGE_KEY_SoundVolume);
+  if (sound_volume_t) {
+    int v = sound_volume_t->value->int32;
+    if (v < 0) v = 0; else if (v > 100) v = 100;
+    s_sound_volume = (uint8_t)v;
+    persist_write_int(PERSIST_KEY_SOUND_VOLUME, v);
+    APP_LOG(APP_LOG_LEVEL_INFO, "Settings: SoundVolume = %d", v);
+#if defined(PBL_SPEAKER)
+    speaker_set_volume(s_sound_volume);
+#endif
   }
   
 
@@ -1222,8 +1274,16 @@ static void loadSettingsFromPersist(void)
   if (persist_exists(PERSIST_KEY_VIBRATION_ENABLED)) {
     s_vibration_enabled = persist_read_bool(PERSIST_KEY_VIBRATION_ENABLED);
   }
-  APP_LOG(APP_LOG_LEVEL_INFO, "Settings: embedded_rom=%d vibration=%d",
-          (int)s_use_embedded_rom, (int)s_vibration_enabled);
+  if (persist_exists(PERSIST_KEY_SOUND_ENABLED)) {
+    s_sound_enabled = persist_read_bool(PERSIST_KEY_SOUND_ENABLED);
+  }
+  if (persist_exists(PERSIST_KEY_SOUND_VOLUME)) {
+    int v = persist_read_int(PERSIST_KEY_SOUND_VOLUME);
+    if (v >= 0 && v <= 100) s_sound_volume = (uint8_t)v;
+  }
+  APP_LOG(APP_LOG_LEVEL_INFO, "Settings: embedded_rom=%d vibration=%d sound=%d vol=%d",
+          (int)s_use_embedded_rom, (int)s_vibration_enabled,
+          (int)s_sound_enabled, (int)s_sound_volume);
 }
 
 // Save current state to local watch storage (persist API). Synchronous,
