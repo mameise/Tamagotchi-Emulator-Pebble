@@ -199,19 +199,17 @@ static bool s_vibe_armed = false;         // ready to vibrate on next buzzer
 
 static void hal_set_frequency(u32_t freq)
 {
-  // tamalib uses deci-Hertz (1638.4 Hz = value 16384). Just store it; we
-  // convert when actually calling the speaker API.
   if (freq == 0) return;
 
-  // If the frequency changed and a tone is currently playing, retrigger
-  // so the new pitch takes effect immediately.
 #if defined(PBL_SPEAKER)
   if (s_speaker_playing && s_sound_enabled && freq != s_tama_freq_dhz) {
     uint16_t hz = (uint16_t)(freq / 10);
-    if (hz < 50)   hz = 50;     // clamp to audible range
+    if (hz < 50)   hz = 50;
     if (hz > 8000) hz = 8000;
     speaker_stop();
-    speaker_play_tone(hz, 10000, s_sound_volume, SpeakerWaveformSquare);
+    bool ok = speaker_play_tone(hz, 10000, s_sound_volume, SpeakerWaveformSquare);
+    APP_LOG(APP_LOG_LEVEL_DEBUG, "speaker retrigger %d Hz vol=%d -> %d",
+            (int)hz, (int)s_sound_volume, (int)ok);
   }
 #endif
 
@@ -220,22 +218,21 @@ static void hal_set_frequency(u32_t freq)
 
 static void hal_play_frequency(bool_t en)
 {
-  // --- Sound output via Pebble Speaker API ---
 #if defined(PBL_SPEAKER)
   if (s_sound_enabled) {
     if (en && !s_speaker_playing) {
-      // Convert dHz -> Hz, clamp to audible/safe range
       uint16_t hz = (uint16_t)(s_tama_freq_dhz / 10);
       if (hz < 50)   hz = 50;
       if (hz > 8000) hz = 8000;
 
-      // Long duration (10s max per docs); we'll cut it off ourselves when
-      // tamalib calls play_frequency(false). This avoids per-cycle setup
-      // clicks from the speaker driver.
-      if (speaker_play_tone(hz, 10000, s_sound_volume, SpeakerWaveformSquare)) {
+      bool ok = speaker_play_tone(hz, 10000, s_sound_volume, SpeakerWaveformSquare);
+      APP_LOG(APP_LOG_LEVEL_DEBUG, "speaker start %d Hz vol=%d -> %d",
+              (int)hz, (int)s_sound_volume, (int)ok);
+      if (ok) {
         s_speaker_playing = true;
       }
     } else if (!en && s_speaker_playing) {
+      APP_LOG(APP_LOG_LEVEL_DEBUG, "speaker stop");
       speaker_stop();
       s_speaker_playing = false;
     }
