@@ -92,13 +92,16 @@ static uint8_t s_sound_volume   = 70;  // 0-100
 static uint32_t s_tama_freq_dhz = 10000;
 static bool     s_speaker_playing = false;
 
-// The Tama emulator toggles the buzzer at very high rates (it uses the toggle
-// itself as PWM to control tone and volume). If we call speaker_play_tone()
-// and speaker_stop() on every toggle we get a click per toggle, not a tone.
-// Instead, we delay the actual speaker_stop() by a small window — if a new
-// "buzzer on" arrives during that window, the speaker keeps playing.
+// Debounce: don't actually stop the speaker for SPEAKER_STOP_DELAY_MS after
+// the buzzer goes off. This avoids click-per-toggle when the Tama produces
+// short menu beeps in rapid succession.
 #define SPEAKER_STOP_DELAY_MS 80
+
+// Throttle: don't try to start a new tone more often than this. Some Pebble
+// audio stacks can crash if play_tone() is hammered with no time in between.
+#define SPEAKER_MIN_RESTART_MS 30
 static AppTimer *s_speaker_stop_timer = NULL;
+static uint32_t s_last_speaker_start_tick = 0;
 
 static void speaker_stop_timer_callback(void *data)
 {
@@ -107,7 +110,6 @@ static void speaker_stop_timer_callback(void *data)
   if (s_speaker_playing) {
     speaker_stop();
     s_speaker_playing = false;
-    APP_LOG(APP_LOG_LEVEL_DEBUG, "speaker stop (delayed)");
   }
 #endif
 }
@@ -218,21 +220,12 @@ static bool s_vibe_armed = false;         // ready to vibrate on next buzzer
 
 static void hal_set_frequency(u32_t freq)
 {
-  if (freq == 0) return;
-
-#if defined(PBL_SPEAKER)
-  if (s_speaker_playing && s_sound_enabled && freq != s_tama_freq_dhz) {
-    uint16_t hz = (uint16_t)(freq / 10);
-    if (hz < 50)   hz = 50;
-    if (hz > 8000) hz = 8000;
-    speaker_stop();
-    bool ok = speaker_play_tone(hz, 10000, s_sound_volume, SpeakerWaveformSquare);
-    APP_LOG(APP_LOG_LEVEL_DEBUG, "speaker retrigger %d Hz vol=%d -> %d",
-            (int)hz, (int)s_sound_volume, (int)ok);
+  // Just remember the frequency. We don't retrigger mid-tone on changes —
+  // the next play_frequency(true) cycle will pick up the new value.
+  // The Tama doesn't change frequency often during a single buzzer phase.
+  if (freq > 0) {
+    s_tama_freq_dhz = freq;
   }
-#endif
-
-  s_tama_freq_dhz = freq;
 }
 
 static void hal_play_frequency(bool_t en)
@@ -247,26 +240,35 @@ static void hal_play_frequency(bool_t en)
       }
 
       if (!s_speaker_playing) {
+        // Throttle: don't restart the speaker faster than SPEAKER_MIN_RESTART_MS.
+        // Rapid play_tone() calls have been observed to crash the audio stack.
+        uint32_t now_ms = time_ms(NULL, NULL);
+        if (now_ms - s_last_speaker_start_tick < SPEAKER_MIN_RESTART_MS) {
+          // Too soon — skip this start. Tamalib will toggle the buzzer again
+          // very soon anyway.
+          goto vibe_check;
+        }
+
         uint16_t hz = (uint16_t)(s_tama_freq_dhz / 10);
         if (hz < 50)   hz = 50;
         if (hz > 8000) hz = 8000;
 
-        bool ok = speaker_play_tone(hz, 10000, s_sound_volume, SpeakerWaveformSquare);
-        APP_LOG(APP_LOG_LEVEL_DEBUG, "speaker start %d Hz vol=%d -> %d",
-                (int)hz, (int)s_sound_volume, (int)ok);
-        if (ok) {
+        if (speaker_play_tone(hz, 10000, s_sound_volume, SpeakerWaveformSquare)) {
           s_speaker_playing = true;
+          s_last_speaker_start_tick = now_ms;
         }
       }
     } else {
-      // Don't stop immediately — schedule a delayed stop. If buzzer comes
-      // back on within SPEAKER_STOP_DELAY_MS, we cancel and keep playing.
+      // Schedule a delayed stop. If buzzer comes back on within
+      // SPEAKER_STOP_DELAY_MS, the timer is cancelled and the speaker
+      // keeps playing.
       if (s_speaker_playing && !s_speaker_stop_timer) {
         s_speaker_stop_timer = app_timer_register(
             SPEAKER_STOP_DELAY_MS, speaker_stop_timer_callback, NULL);
       }
     }
   }
+vibe_check:;
 #endif
 
   // --- Vibration on attention (independent of sound) ---
