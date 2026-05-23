@@ -24,7 +24,6 @@ static bool persistSaveState(void);
 static bool persistLoadState(void);
 static bool loadRomFromResource(void);
 static void loadSettingsFromPersist(void);
-static void local_boot_timer_callback(void *data);
 static void autosave_timer_callback(void *data);
 
 static Window *s_main_window;
@@ -1036,28 +1035,6 @@ static void rtc_sync_timer_callback(void *data)
 // One-shot timer callback: try local boot after init() returned and the
 // Pebble event loop is running. This avoids any lifecycle weirdness from
 // initializing tamalib/timers while still inside init().
-static void local_boot_timer_callback(void *data)
-{
-  if (s_hasReceivedRom) return;  // safety: already booted somehow
-
-  if (loadRomFromResource()) {
-    s_hasReceivedRom = true;
-    s_clearTextLayerOnScreenRefresh = true;
-
-    if (persistLoadState()) {
-      APP_LOG(APP_LOG_LEVEL_INFO, "Local boot: ROM + persist state loaded");
-      s_hasReceivedSaveFile = true;
-      s_loadedFromPersist = true;
-      initTamalib();
-    } else {
-      APP_LOG(APP_LOG_LEVEL_INFO, "Local boot: ROM loaded, no persist state -> fresh start");
-      initTamalib();
-    }
-  } else {
-    APP_LOG(APP_LOG_LEVEL_WARNING, "No local ROM resource — falling back to phone");
-  }
-}
-
 static void init() {
   // Log why we (re)started — helps debug unexpected app restarts.
   // APP_LAUNCH_TIMEOUT_TIMER_CANCELLED = OS killed us for inactivity/memory.
