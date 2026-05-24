@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Tama P1 ROM Converter</title>
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    max-width: 700px;
+    margin: 2em auto;
+    padding: 1em;
+    line-height: 1.5;
+    color: #222;
+  }
+  h1 { margin-bottom: 0.3em; }
+  .sub { color: #666; margin-bottom: 1.5em; }
+  button {
+    padding: 0.6em 1.2em;
+    font-size: 1em;
+    margin: 0.3em 0.5em 0.3em 0;
+    cursor: pointer;
+    background: #2563eb;
+    color: white;
+    border: none;
+    border-radius: 4px;
+  }
+  button:hover { background: #1d4ed8; }
+  button:disabled { background: #999; cursor: not-allowed; }
+  input[type=file] {
+    display: block;
+    margin: 0.5em 0 1em 0;
+    font-size: 1em;
+  }
+  #log {
+    background: #f3f4f6;
+    padding: 1em;
+    margin-top: 1.5em;
+    white-space: pre-wrap;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 0.85em;
+    border-radius: 4px;
+    min-height: 100px;
+  }
+  .section {
+    border: 1px solid #e5e7eb;
+    padding: 1.2em;
+    margin: 1em 0;
+    border-radius: 6px;
+    background: #fafafa;
+  }
+  .note {
+    background: #fef3c7;
+    padding: 0.8em 1em;
+    border-radius: 4px;
+    border-left: 3px solid #f59e0b;
+    margin: 1em 0;
+    font-size: 0.95em;
+  }
+  code {
+    background: #e5e7eb;
+    padding: 0.1em 0.3em;
+    border-radius: 3px;
+    font-family: ui-monospace, monospace;
+  }
+</style>
+</head>
+<body>
+
+<h1>Tama P1 ROM Converter</h1>
+<p class="sub">Converts a Tamagotchi P1 ROM file to the byte order expected by this emulator.</p>
+
+<div class="note">
+  <strong>What this does:</strong> The Tamagotchi P1 ROM circulating online uses big-endian byte order, but the tamalib emulator expects little-endian. This tool swaps the byte pairs so the ROM works.
+</div>
+
+<div class="section">
+  <h3>1. Pick your ROM file</h3>
+  <p>Select your <code>rom.bin</code> (or whatever it's called). It should be exactly 12288 bytes.</p>
+  <input type="file" id="binFile" accept=".bin,application/octet-stream">
+</div>
+
+<div class="section">
+  <h3>2. Analyze (optional)</h3>
+  <p>Check the byte order and structure. Tells you if you need to swap or not.</p>
+  <button id="analyzeBin" disabled>Analyze ROM</button>
+</div>
+
+<div class="section">
+  <h3>3. Swap bytes and download</h3>
+  <p>Swaps each byte pair and saves a new file <code>tama_p1.bin</code>. This is the file you upload as a resource in CloudPebble.</p>
+  <button id="swapBin" disabled>Swap bytes &amp; download tama_p1.bin</button>
+</div>
+
+<div id="log">Pick a file to begin...</div>
+
+<script>
+let romBuffer = null;
+
+function log(msg) {
+  document.getElementById('log').textContent += msg + '\n';
+}
+
+function clearLog() {
+  document.getElementById('log').textContent = '';
+}
+
+function download(buffer, filename) {
+  const blob = new Blob([buffer], { type: 'application/octet-stream' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+function readFile(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = e => resolve(new Uint8Array(e.target.result));
+    reader.onerror = reject;
+    reader.readAsArrayBuffer(file);
+  });
+}
+
+document.getElementById('binFile').addEventListener('change', async (ev) => {
+  const f = ev.target.files[0];
+  if (!f) return;
+  clearLog();
+  log('Loading ' + f.name + '...');
+  romBuffer = await readFile(f);
+  log('Loaded ' + romBuffer.length + ' bytes.');
+  if (romBuffer.length !== 12288) {
+    log('WARNING: Expected 12288 bytes. This file is ' + romBuffer.length + '.');
+    log('It might not be a valid Tamagotchi P1 ROM.');
+  } else {
+    log('Size looks correct (12288 bytes = 6144 12-bit words).');
+  }
+  document.getElementById('analyzeBin').disabled = false;
+  document.getElementById('swapBin').disabled = false;
+});
+
+document.getElementById('analyzeBin').addEventListener('click', () => {
+  if (!romBuffer) return;
+  log('');
+  log('--- Analysis ---');
+  log('First 16 bytes (current order):');
+  let hex = '';
+  for (let i = 0; i < 16; i++) {
+    hex += romBuffer[i].toString(16).padStart(2, '0') + ' ';
+  }
+  log('  ' + hex);
+
+  // Read first few words as little-endian (LE) and big-endian (BE)
+  log('');
+  log('First 4 words as 12-bit values:');
+  log('  little-endian: '
+    + [0, 2, 4, 6].map(i => {
+        const v = (romBuffer[i] | (romBuffer[i+1] << 8)) & 0xFFF;
+        return '0x' + v.toString(16).padStart(3, '0');
+      }).join(', ')
+  );
+  log('  big-endian:    '
+    + [0, 2, 4, 6].map(i => {
+        const v = ((romBuffer[i] << 8) | romBuffer[i+1]) & 0xFFF;
+        return '0x' + v.toString(16).padStart(3, '0');
+      }).join(', ')
+  );
+
+  log('');
+  log('A valid Tamagotchi P1 ROM starts with code, so the first word');
+  log('should be a reasonable 12-bit instruction (usually starts with 0x0xx');
+  log('or similar low values for jumps/loads).');
+  log('');
+  log('If little-endian looks meaningful (low values like 0x0xx, 0x1xx, etc),');
+  log('the file is already in the right format — no swap needed.');
+  log('If big-endian looks meaningful, you need to swap the bytes.');
+});
+
+document.getElementById('swapBin').addEventListener('click', () => {
+  if (!romBuffer) return;
+  log('');
+  log('--- Swapping bytes ---');
+  const swapped = new Uint8Array(romBuffer.length);
+  for (let i = 0; i < romBuffer.length; i += 2) {
+    swapped[i]     = romBuffer[i + 1];
+    swapped[i + 1] = romBuffer[i];
+  }
+  log('Swapped ' + (romBuffer.length / 2) + ' byte pairs.');
+  log('First 16 bytes after swap:');
+  let hex = '';
+  for (let i = 0; i < 16; i++) {
+    hex += swapped[i].toString(16).padStart(2, '0') + ' ';
+  }
+  log('  ' + hex);
+  log('');
+  log('Downloading tama_p1.bin...');
+  download(swapped, 'tama_p1.bin');
+  log('Done! Upload this file as resource TAMA_ROM in CloudPebble.');
+});
+</script>
+
+</body>
+</html>
