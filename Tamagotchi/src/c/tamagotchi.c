@@ -30,6 +30,7 @@ static Window *s_main_window;
 static BitmapLayer *s_background_layer;
 static Layer *s_screen_layer;
 static Layer *s_icons_layer;
+static Layer *s_hands_layer = NULL;  // analog clock hands (Emery)
 static TextLayer *s_text_layer;
 static TextLayer *s_battery_layer = NULL;
 static char s_battery_text[8] = "";
@@ -407,7 +408,13 @@ static void icons_update_proc(Layer *layer, GContext *ctx) {
 
   if(s_selectedIcon >= 0)
   {
-    #if defined(PBL_PLATFORM_EMERY) || defined(PBL_PLATFORM_GABBRO)
+    #if defined(PBL_PLATFORM_EMERY)
+    // New Emery layout: icons in 2 rows of 4, centered on screen.
+    // Row 0-3 above Tama (y=118), row 4-7 below Tama (y=176).
+    // Icon spacing: starting at x=41, step 30px (27 wide + 3 gap).
+    uint8_t xPos = 41 + ((s_selectedIcon % 4) * 30);
+    uint8_t yPos = (s_selectedIcon > 3 ? 176 : 118);
+    #elif defined(PBL_PLATFORM_GABBRO)
     uint8_t xPos = 12 + ((s_selectedIcon%4) * 40); 
     uint8_t yPos = (s_selectedIcon > 3 ? 120 : 0);
     #else
@@ -455,12 +462,68 @@ static void icons_update_proc(Layer *layer, GContext *ctx) {
   // Handle attention icon
   if(s_showingAttentionIcon)
   {
-    #if defined(PBL_PLATFORM_EMERY) || defined(PBL_PLATFORM_GABBRO)
+    #if defined(PBL_PLATFORM_EMERY)
+    // Show attention icon at the rightmost position in the bottom row
+    graphics_draw_bitmap_in_rect(ctx, s_bitmap_icon8, GRect(41 + 3*30, 176, 27, 22));
+    #elif defined(PBL_PLATFORM_GABBRO)
     graphics_draw_bitmap_in_rect(ctx, s_bitmap_icon8, GRect(12+(40*3), 120, 27, 22)); 
     #else
     graphics_draw_bitmap_in_rect(ctx, s_bitmap_icon8, GRect(108, 100, 22, 18));
     #endif
   }
+}
+
+// Analog clock hands (Emery only). Draws hour + minute hand rotating around
+// the screen center. Called via layer_mark_dirty whenever the time updates.
+static void hands_update_proc(Layer *layer, GContext *ctx)
+{
+#if defined(PBL_PLATFORM_EMERY)
+  GRect bounds = layer_get_bounds(layer);
+  GPoint center = GPoint(bounds.size.w / 2, bounds.size.h / 2);
+
+  time_t now = time(NULL);
+  struct tm *t = localtime(&now);
+  if (!t) return;
+
+  int hour = t->tm_hour % 12;
+  int minute = t->tm_min;
+
+  // Angles in Pebble's TRIG_MAX_RATIO units (65536 = full circle)
+  // 12 o'clock = up = -90 degrees from standard math, but Pebble's trig has 0
+  // at "up" (north) by convention. Use TRIG_MAX_ANGLE / 12 per hour.
+  int32_t hour_angle = TRIG_MAX_ANGLE * (hour * 60 + minute) / (12 * 60);
+  int32_t min_angle  = TRIG_MAX_ANGLE * minute / 60;
+
+  // Hand lengths
+  int hh_len = 38;
+  int mh_len = 60;
+
+  // Hour hand endpoint
+  GPoint hour_end = {
+    .x = (int16_t)(sin_lookup(hour_angle) * hh_len / TRIG_MAX_RATIO) + center.x,
+    .y = (int16_t)(-cos_lookup(hour_angle) * hh_len / TRIG_MAX_RATIO) + center.y,
+  };
+
+  // Minute hand endpoint
+  GPoint min_end = {
+    .x = (int16_t)(sin_lookup(min_angle) * mh_len / TRIG_MAX_RATIO) + center.x,
+    .y = (int16_t)(-cos_lookup(min_angle) * mh_len / TRIG_MAX_RATIO) + center.y,
+  };
+
+  graphics_context_set_stroke_color(ctx, GColorWhite);
+  graphics_context_set_fill_color(ctx, GColorWhite);
+
+  // Hour hand: thick
+  graphics_context_set_stroke_width(ctx, 4);
+  graphics_draw_line(ctx, center, hour_end);
+
+  // Minute hand: thinner
+  graphics_context_set_stroke_width(ctx, 2);
+  graphics_draw_line(ctx, center, min_end);
+
+  // Center dot
+  graphics_fill_circle(ctx, center, 3);
+#endif
 }
 
 // Handles drawing screen layer
@@ -475,7 +538,10 @@ static void screen_update_proc(Layer *layer, GContext *ctx) {
     {
       if (s_screen_buffer[h][w])
       {
-        #if defined(PBL_PLATFORM_EMERY) || defined(PBL_PLATFORM_GABBRO)
+        #if defined(PBL_PLATFORM_EMERY)
+        // 2x scale for Emery: 32x16 tama pixels -> 64x32 pebble pixels
+        graphics_fill_rect(ctx, GRect(w * 2, h * 2, 2, 2), 0, GCornerNone);
+        #elif defined(PBL_PLATFORM_GABBRO)
         graphics_fill_rect(ctx, GRect(w * 5, h * 5, 4, 4), 0, GCornerNone);
         #else
         graphics_fill_rect(ctx, GRect(w * 4, h * 4, 3, 3), 0, GCornerNone);
@@ -769,6 +835,11 @@ static void update_clock_text(void)
   // Date: e.g. "Mo 21.05"
   strftime(s_date_text, sizeof(s_date_text), "%a %d.%m", t);
   text_layer_set_text(s_date_layer, s_date_text);
+
+  // Trigger redraw of analog hands (Emery only)
+  if (s_hands_layer) {
+    layer_mark_dirty(s_hands_layer);
+  }
 }
 
 static void clock_timer_callback(void *data)
@@ -815,6 +886,13 @@ static void main_window_load(Window *window) {
   // Add it as a child layer to the Window's root layer
   layer_add_child(window_layer, bitmap_layer_get_layer(s_background_layer));
 
+#if defined(PBL_PLATFORM_EMERY)
+  // Create analog clock hands layer (covers full screen, transparent)
+  s_hands_layer = layer_create(GRect(0, 0, 200, 228));
+  layer_set_update_proc(s_hands_layer, hands_update_proc);
+  layer_add_child(window_layer, s_hands_layer);
+#endif
+
   // Create bitmaps for icons
   s_bitmap_icon1 = gbitmap_create_with_resource(RESOURCE_ID_ICON1);
   s_bitmap_icon2 = gbitmap_create_with_resource(RESOURCE_ID_ICON2);
@@ -831,7 +909,8 @@ static void main_window_load(Window *window) {
 #elif defined(PBL_PLATFORM_GABBRO) 
   s_icons_layer = layer_create(GRect(0+45, 60, 180, 183)); 
 #elif defined(PBL_PLATFORM_EMERY)
-  s_icons_layer = layer_create(GRect(0+15, 44, 180, 183)); 
+  // Icons layer covers most of the screen so we can use absolute-ish coords inside
+  s_icons_layer = layer_create(GRect(0, 0, 200, 228)); 
 #else
   s_icons_layer = layer_create(GRect(0, 24, 144, 146));
 #endif
@@ -846,7 +925,10 @@ static void main_window_load(Window *window) {
 #elif defined(PBL_PLATFORM_GABBRO)
   s_screen_layer = layer_create(GRect(50, 92, 160, 80));
 #elif defined(PBL_PLATFORM_EMERY)
-  s_screen_layer = layer_create(GRect(20, 76, 160, 80));
+  // New Emery layout: tama LCD 2x scaled (64x32), centered horizontally,
+  // positioned in the bottom half. Surrounded by hour markers, menu icons,
+  // and analog clock hands.
+  s_screen_layer = layer_create(GRect(68, 142, 64, 32));
 #else
   s_screen_layer = layer_create(GRect(8, 51, 128, 64));
 #endif
@@ -864,7 +946,7 @@ static void main_window_load(Window *window) {
   #elif defined(PBL_PLATFORM_GABBRO)
   s_text_layer = text_layer_create(GRect(50, 60+46, 158, 50));
   #elif defined(PBL_PLATFORM_EMERY)
-  s_text_layer = text_layer_create(GRect(20, 60+30, 158, 50));
+  s_text_layer = text_layer_create(GRect(10, 100, 180, 30));
   #else   
   s_text_layer = text_layer_create(GRect(6, 60, 128, 50)); 
   #endif
@@ -886,12 +968,14 @@ static void main_window_load(Window *window) {
   GFont time_font    = fonts_get_system_font(FONT_KEY_BITHAM_42_BOLD);
   GFont small_font   = fonts_get_system_font(FONT_KEY_GOTHIC_28_BOLD);
 #elif defined(PBL_PLATFORM_EMERY)
-  // Emery: 200x228, tama LCD at y=76-156
-  s_time_layer    = text_layer_create(GRect(8,   2, 110, 42));
-  s_battery_layer = text_layer_create(GRect(118, 8, 80, 30));
-  s_date_layer    = text_layer_create(GRect(10, 195, 180, 26));
-  GFont time_font    = fonts_get_system_font(FONT_KEY_BITHAM_34_MEDIUM_NUMBERS);
-  GFont small_font   = fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD);
+  // Pebble Time 2: 200x228 with clock face layout.
+  // Digital time: centered, between top hour markers (12 row) and middle.
+  // Battery + Date: in the band BELOW that, ABOVE the analog hand area.
+  s_time_layer    = text_layer_create(GRect(0,   26, 200, 30));
+  s_battery_layer = text_layer_create(GRect(20,  62,  80, 20));
+  s_date_layer    = text_layer_create(GRect(100, 62,  80, 20));
+  GFont time_font    = fonts_get_system_font(FONT_KEY_GOTHIC_28_BOLD);
+  GFont small_font   = fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD);
 #elif defined(PBL_PLATFORM_CHALK)
   // Round 180x180 — corners less useful, use top-center / bottom-center
   s_time_layer    = text_layer_create(GRect(10,   4, 80, 30));
@@ -911,12 +995,21 @@ static void main_window_load(Window *window) {
   // Common style for all three. Time gets its own (bigger) font.
   text_layer_set_background_color(s_time_layer, GColorClear);
   text_layer_set_text_color(s_time_layer, GColorWhite);
+#if defined(PBL_PLATFORM_EMERY)
+  text_layer_set_text_alignment(s_time_layer, GTextAlignmentCenter);
+#else
   text_layer_set_text_alignment(s_time_layer, GTextAlignmentLeft);
+#endif
   text_layer_set_font(s_time_layer, time_font);
   layer_add_child(window_layer, text_layer_get_layer(s_time_layer));
 
   TextLayer *small_infos[2] = { s_battery_layer, s_date_layer };
+#if defined(PBL_PLATFORM_EMERY)
+  // Emery: battery LEFT, date RIGHT
+  GTextAlignment small_aligns[2] = { GTextAlignmentLeft, GTextAlignmentRight };
+#else
   GTextAlignment small_aligns[2] = { GTextAlignmentRight, GTextAlignmentCenter };
+#endif
   for (int i = 0; i < 2; i++) {
     text_layer_set_background_color(small_infos[i], GColorClear);
     text_layer_set_text_color(small_infos[i], GColorWhite);
@@ -956,6 +1049,10 @@ static void main_window_unload(Window *window) {
   if (s_date_layer) {
     text_layer_destroy(s_date_layer);
     s_date_layer = NULL;
+  }
+  if (s_hands_layer) {
+    layer_destroy(s_hands_layer);
+    s_hands_layer = NULL;
   }
 
   // Destroy backrgound bitmap and its layer
