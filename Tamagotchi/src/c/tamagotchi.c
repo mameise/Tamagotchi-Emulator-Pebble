@@ -108,13 +108,14 @@ static bool s_use_embedded_rom  = true;
 static bool s_vibration_enabled = true;
 
 // Customization settings. Colors stored as Pebble's argb8 packed format
-// (1 byte). On B&W displays only black/white will render meaningfully.
-static uint8_t s_text_color_argb     = 0;  // 0 = default (filled in at init based on platform)
-static uint8_t s_text_outline_color_argb = 0;
-static bool    s_text_outline_enabled = true;
-static uint8_t s_hands_color_argb    = 0;
-static uint8_t s_hands_outline_color_argb = 0;
-static uint8_t s_hands_thickness     = 1;  // 0=thin, 1=normal, 2=thick
+// (1 byte). Defaults initialized to white text / black outline so even if
+// loadSettingsFromPersist hasn't run yet, the first render is sensible.
+static uint8_t s_text_color_argb         = 0xFF;  // GColorWhiteARGB8
+static uint8_t s_text_outline_color_argb = 0xC0;  // GColorBlackARGB8
+static bool    s_text_outline_enabled    = true;
+static uint8_t s_hands_color_argb        = 0xFF;
+static uint8_t s_hands_outline_color_argb = 0xC0;
+static uint8_t s_hands_thickness         = 1;  // 0=thin, 1=normal, 2=thick
 static bool s_sound_enabled     = false;  // OFF by default — opt-in feature
 static uint8_t s_sound_volume   = 60;
 
@@ -1517,11 +1518,12 @@ static void init() {
   APP_LOG(APP_LOG_LEVEL_INFO, "Auto-save disabled");
 #endif
 
+  // Load user settings from persist BEFORE the window's main_window_load
+  // runs (it uses these settings when applying initial text/hands colors).
+  loadSettingsFromPersist();
+
   // Show the Window on the watch, with animated=true
   window_stack_push(s_main_window, true);
-
-  // Load user settings from persist before anything that depends on them
-  loadSettingsFromPersist();
 
   // Try local boot if enabled by user setting (default: on)
   if (s_use_embedded_rom) {
