@@ -39,6 +39,12 @@ static TextLayer *s_time_layer = NULL;
 static char s_time_text[8] = "";
 static TextLayer *s_date_layer = NULL;
 static char s_date_text[16] = "";
+
+// Shadow text layers used to fake an outline effect (4 offsets per text).
+// Only created on Emery — null on other platforms.
+static TextLayer *s_time_shadow[4]    = {NULL, NULL, NULL, NULL};
+static TextLayer *s_battery_shadow[4] = {NULL, NULL, NULL, NULL};
+static TextLayer *s_date_shadow[4]    = {NULL, NULL, NULL, NULL};
 //static GFont s_lcd_font;
 
 // Bitmaps
@@ -79,6 +85,12 @@ static AppTimer *screen_tick_handler;
 // Persistent settings keys (separate from save-state keys)
 #define PERSIST_KEY_USE_EMBEDDED_ROM  200
 #define PERSIST_KEY_VIBRATION_ENABLED 201
+#define PERSIST_KEY_TEXT_COLOR        204
+#define PERSIST_KEY_TEXT_OUTLINE      205
+#define PERSIST_KEY_TEXT_OUTLINE_COLOR 206
+#define PERSIST_KEY_HANDS_COLOR       207
+#define PERSIST_KEY_HANDS_OUTLINE_COLOR 208
+#define PERSIST_KEY_HANDS_THICKNESS   209
 
 // Crash / lifecycle diagnostics keys
 #define PERSIST_KEY_LAST_LAUNCH_TS    300  // time_t of last init()
@@ -92,6 +104,15 @@ static AppTimer *screen_tick_handler;
 // Runtime settings — loaded from persist on startup, updated from Clay config.
 static bool s_use_embedded_rom  = true;
 static bool s_vibration_enabled = true;
+
+// Customization settings. Colors stored as Pebble's argb8 packed format
+// (1 byte). On B&W displays only black/white will render meaningfully.
+static uint8_t s_text_color_argb     = 0;  // 0 = default (filled in at init based on platform)
+static uint8_t s_text_outline_color_argb = 0;
+static bool    s_text_outline_enabled = true;
+static uint8_t s_hands_color_argb    = 0;
+static uint8_t s_hands_outline_color_argb = 0;
+static uint8_t s_hands_thickness     = 1;  // 0=thin, 1=normal, 2=thick
 static bool s_sound_enabled     = false;  // OFF by default — opt-in feature
 static uint8_t s_sound_volume   = 60;
 
@@ -560,27 +581,39 @@ static void hands_update_proc(Layer *layer, GContext *ctx)
     .y = (int16_t)(-cos_lookup(min_angle) * mh_len / TRIG_MAX_RATIO) + center.y,
   };
 
-  // Outlined hands: draw thick BLACK underneath, then thinner WHITE on top.
-  // Hour hand
-  graphics_context_set_stroke_color(ctx, GColorBlack);
-  graphics_context_set_stroke_width(ctx, 6);
+  // Thickness presets — outline is always thickness+2 to give a visible border
+  int inner_thick_h, inner_thick_m;
+  switch (s_hands_thickness) {
+    case 0: inner_thick_h = 3; inner_thick_m = 1; break;
+    case 2: inner_thick_h = 6; inner_thick_m = 3; break;
+    default: inner_thick_h = 4; inner_thick_m = 2; break;
+  }
+  int outline_thick_h = inner_thick_h + 2;
+  int outline_thick_m = inner_thick_m + 2;
+
+  GColor hands_color    = (GColor){.argb = s_hands_color_argb};
+  GColor outline_color  = (GColor){.argb = s_hands_outline_color_argb};
+
+  // Hour hand: outline first, then inner color
+  graphics_context_set_stroke_color(ctx, outline_color);
+  graphics_context_set_stroke_width(ctx, outline_thick_h);
   graphics_draw_line(ctx, center, hour_end);
-  graphics_context_set_stroke_color(ctx, GColorWhite);
-  graphics_context_set_stroke_width(ctx, 4);
+  graphics_context_set_stroke_color(ctx, hands_color);
+  graphics_context_set_stroke_width(ctx, inner_thick_h);
   graphics_draw_line(ctx, center, hour_end);
 
   // Minute hand
-  graphics_context_set_stroke_color(ctx, GColorBlack);
-  graphics_context_set_stroke_width(ctx, 4);
+  graphics_context_set_stroke_color(ctx, outline_color);
+  graphics_context_set_stroke_width(ctx, outline_thick_m);
   graphics_draw_line(ctx, center, min_end);
-  graphics_context_set_stroke_color(ctx, GColorWhite);
-  graphics_context_set_stroke_width(ctx, 2);
+  graphics_context_set_stroke_color(ctx, hands_color);
+  graphics_context_set_stroke_width(ctx, inner_thick_m);
   graphics_draw_line(ctx, center, min_end);
 
-  // Center dot: black ring around white center
-  graphics_context_set_fill_color(ctx, GColorBlack);
+  // Center dot
+  graphics_context_set_fill_color(ctx, outline_color);
   graphics_fill_circle(ctx, center, 5);
-  graphics_context_set_fill_color(ctx, GColorWhite);
+  graphics_context_set_fill_color(ctx, hands_color);
   graphics_fill_circle(ctx, center, 3);
 #endif
 }
@@ -677,7 +710,62 @@ static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) 
     persist_write_int(PERSIST_KEY_SOUND_VOLUME, v);
     APP_LOG(APP_LOG_LEVEL_INFO, "Settings: SoundVolume = %d", v);
   }
-  
+
+  // ---- Customization settings ----
+  bool customization_changed = false;
+
+  Tuple *text_color_t = dict_find(iter, MESSAGE_KEY_TextColor);
+  if (text_color_t) {
+    s_text_color_argb = (uint8_t)text_color_t->value->int32;
+    persist_write_int(PERSIST_KEY_TEXT_COLOR, s_text_color_argb);
+    customization_changed = true;
+    APP_LOG(APP_LOG_LEVEL_INFO, "Settings: TextColor = 0x%02x", (int)s_text_color_argb);
+  }
+  Tuple *text_outline_t = dict_find(iter, MESSAGE_KEY_TextOutline);
+  if (text_outline_t) {
+    s_text_outline_enabled = (text_outline_t->value->int32 != 0);
+    persist_write_bool(PERSIST_KEY_TEXT_OUTLINE, s_text_outline_enabled);
+    customization_changed = true;
+  }
+  Tuple *text_outline_color_t = dict_find(iter, MESSAGE_KEY_TextOutlineColor);
+  if (text_outline_color_t) {
+    s_text_outline_color_argb = (uint8_t)text_outline_color_t->value->int32;
+    persist_write_int(PERSIST_KEY_TEXT_OUTLINE_COLOR, s_text_outline_color_argb);
+    customization_changed = true;
+  }
+  Tuple *hands_color_t = dict_find(iter, MESSAGE_KEY_HandsColor);
+  if (hands_color_t) {
+    s_hands_color_argb = (uint8_t)hands_color_t->value->int32;
+    persist_write_int(PERSIST_KEY_HANDS_COLOR, s_hands_color_argb);
+    customization_changed = true;
+  }
+  Tuple *hands_outline_color_t = dict_find(iter, MESSAGE_KEY_HandsOutlineColor);
+  if (hands_outline_color_t) {
+    s_hands_outline_color_argb = (uint8_t)hands_outline_color_t->value->int32;
+    persist_write_int(PERSIST_KEY_HANDS_OUTLINE_COLOR, s_hands_outline_color_argb);
+    customization_changed = true;
+  }
+  Tuple *hands_thickness_t = dict_find(iter, MESSAGE_KEY_HandsThickness);
+  if (hands_thickness_t) {
+    int v = hands_thickness_t->value->int32;
+    if (v < 0) v = 0; else if (v > 2) v = 2;
+    s_hands_thickness = (uint8_t)v;
+    persist_write_int(PERSIST_KEY_HANDS_THICKNESS, v);
+    customization_changed = true;
+  }
+
+  if (customization_changed) {
+    // Re-render everything that uses these colors
+    if (s_hands_layer) layer_mark_dirty(s_hands_layer);
+    update_clock_text();  // re-renders time + date text layers
+    battery_handler(battery_state_service_peek());
+    APP_LOG(APP_LOG_LEVEL_INFO,
+            "Customization updated: text=0x%02x outline=%d/0x%02x hands=0x%02x/0x%02x thick=%d",
+            (int)s_text_color_argb, (int)s_text_outline_enabled,
+            (int)s_text_outline_color_argb,
+            (int)s_hands_color_argb, (int)s_hands_outline_color_argb,
+            (int)s_hands_thickness);
+  }
 
   // handle incoming rom
   Tuple *offset_t = dict_find(iter, MESSAGE_KEY_ROMOffset);
@@ -881,6 +969,33 @@ static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) 
 // tick_timer_service issue we had earlier.
 static AppTimer *s_clock_timer = NULL;
 
+// Apply current customization (text color + outline) to a primary text
+// layer and its 4 shadow layers. Shadows are kept hidden when outline is
+// disabled.
+static void apply_text_layer_style(TextLayer *primary, TextLayer **shadows)
+{
+  if (!primary) return;
+  GColor fill = (GColor){.argb = s_text_color_argb};
+  GColor outline = (GColor){.argb = s_text_outline_color_argb};
+  text_layer_set_text_color(primary, fill);
+  if (shadows) {
+    for (int i = 0; i < 4; i++) {
+      if (!shadows[i]) continue;
+      text_layer_set_text_color(shadows[i], outline);
+      layer_set_hidden(text_layer_get_layer(shadows[i]), !s_text_outline_enabled);
+    }
+  }
+}
+
+// Mirror the text content from primary into all 4 shadow layers.
+static void sync_shadow_text(TextLayer **shadows, const char *text)
+{
+  if (!shadows) return;
+  for (int i = 0; i < 4; i++) {
+    if (shadows[i]) text_layer_set_text(shadows[i], text);
+  }
+}
+
 static void update_clock_text(void)
 {
   if (!s_time_layer || !s_date_layer) return;
@@ -891,10 +1006,17 @@ static void update_clock_text(void)
   // Time: HH:MM (24h)
   strftime(s_time_text, sizeof(s_time_text), "%H:%M", t);
   text_layer_set_text(s_time_layer, s_time_text);
+  sync_shadow_text(s_time_shadow, s_time_text);
 
   // Date: e.g. "Mo 21.05"
   strftime(s_date_text, sizeof(s_date_text), "%a %d.%m", t);
   text_layer_set_text(s_date_layer, s_date_text);
+  sync_shadow_text(s_date_shadow, s_date_text);
+
+  // Re-apply styling (in case colors changed via settings update)
+  apply_text_layer_style(s_time_layer,    s_time_shadow);
+  apply_text_layer_style(s_date_layer,    s_date_shadow);
+  apply_text_layer_style(s_battery_layer, s_battery_shadow);
 
   // Trigger redraw of analog hands (Emery only)
   if (s_hands_layer) {
@@ -951,6 +1073,7 @@ static void battery_handler(BatteryChargeState state)
            state.is_charging ? "+" : "",
            (int)state.charge_percent);
   text_layer_set_text(s_battery_layer, s_battery_text);
+  sync_shadow_text(s_battery_shadow, s_battery_text);
 }
 
 static void main_window_load(Window *window) {
@@ -1100,7 +1223,6 @@ static void main_window_load(Window *window) {
   text_layer_set_text_alignment(s_time_layer, GTextAlignmentLeft);
 #endif
   text_layer_set_font(s_time_layer, time_font);
-  layer_add_child(window_layer, text_layer_get_layer(s_time_layer));
 
   TextLayer *small_infos[2] = { s_battery_layer, s_date_layer };
 #if defined(PBL_PLATFORM_EMERY)
@@ -1114,8 +1236,49 @@ static void main_window_load(Window *window) {
     text_layer_set_text_color(small_infos[i], GColorWhite);
     text_layer_set_text_alignment(small_infos[i], small_aligns[i]);
     text_layer_set_font(small_infos[i], small_font);
+  }
+
+#if defined(PBL_PLATFORM_EMERY)
+  // Outline shadow layers for Emery: 4 offsets per text (NW, NE, SW, SE).
+  // We attach them FIRST so the primary text draws on top.
+  static const int OFF[4][2] = {{-1,-1},{1,-1},{-1,1},{1,1}};
+
+  TextLayer *primaries[3]      = { s_time_layer, s_battery_layer, s_date_layer };
+  TextLayer **shadow_arrays[3] = { s_time_shadow, s_battery_shadow, s_date_shadow };
+  GFont        fonts[3]        = { time_font, small_font, small_font };
+  GRect frames[3] = {
+    GRect(0,   26, 200, 30),
+    GRect(35,  62,  70, 20),
+    GRect(95,  62,  85, 20),
+  };
+  GTextAlignment aligns_em[3] = {
+    GTextAlignmentCenter, GTextAlignmentLeft, GTextAlignmentRight
+  };
+
+  for (int t = 0; t < 3; t++) {
+    for (int i = 0; i < 4; i++) {
+      GRect r = frames[t];
+      r.origin.x += OFF[i][0];
+      r.origin.y += OFF[i][1];
+      shadow_arrays[t][i] = text_layer_create(r);
+      text_layer_set_background_color(shadow_arrays[t][i], GColorClear);
+      text_layer_set_text_color(shadow_arrays[t][i], GColorBlack);
+      text_layer_set_text_alignment(shadow_arrays[t][i], aligns_em[t]);
+      text_layer_set_font(shadow_arrays[t][i], fonts[t]);
+      layer_add_child(window_layer, text_layer_get_layer(shadow_arrays[t][i]));
+    }
+  }
+  // primaries attached AFTER shadows so they draw on top
+  for (int t = 0; t < 3; t++) {
+    layer_add_child(window_layer, text_layer_get_layer(primaries[t]));
+  }
+#else
+  // Non-Emery platforms: simple attach in original order
+  layer_add_child(window_layer, text_layer_get_layer(s_time_layer));
+  for (int i = 0; i < 2; i++) {
     layer_add_child(window_layer, text_layer_get_layer(small_infos[i]));
   }
+#endif
 
   // Initial values + subscriptions
   battery_state_service_subscribe(battery_handler);
@@ -1145,6 +1308,14 @@ static void main_window_unload(Window *window) {
 
   // Unsubscribe battery service
   battery_state_service_unsubscribe();
+
+  // Destroy shadow layers first (only created on Emery, NULL otherwise)
+  for (int i = 0; i < 4; i++) {
+    if (s_time_shadow[i])    { text_layer_destroy(s_time_shadow[i]);    s_time_shadow[i]    = NULL; }
+    if (s_battery_shadow[i]) { text_layer_destroy(s_battery_shadow[i]); s_battery_shadow[i] = NULL; }
+    if (s_date_shadow[i])    { text_layer_destroy(s_date_shadow[i]);    s_date_shadow[i]    = NULL; }
+  }
+
   if (s_battery_layer) {
     text_layer_destroy(s_battery_layer);
     s_battery_layer = NULL;
@@ -1536,9 +1707,46 @@ static void loadSettingsFromPersist(void)
     int v = persist_read_int(PERSIST_KEY_SOUND_VOLUME);
     if (v >= 0 && v <= 100) s_sound_volume = (uint8_t)v;
   }
-  APP_LOG(APP_LOG_LEVEL_INFO, "Settings: embedded_rom=%d vibration=%d sound=%d vol=%d",
+
+  // Customization: defaults are white text/hands with black outline
+  s_text_color_argb         = GColorWhiteARGB8;
+  s_text_outline_color_argb = GColorBlackARGB8;
+  s_hands_color_argb        = GColorWhiteARGB8;
+  s_hands_outline_color_argb = GColorBlackARGB8;
+  s_text_outline_enabled    = true;
+  s_hands_thickness         = 1;
+
+  if (persist_exists(PERSIST_KEY_TEXT_COLOR)) {
+    s_text_color_argb = (uint8_t)persist_read_int(PERSIST_KEY_TEXT_COLOR);
+  }
+  if (persist_exists(PERSIST_KEY_TEXT_OUTLINE)) {
+    s_text_outline_enabled = persist_read_bool(PERSIST_KEY_TEXT_OUTLINE);
+  }
+  if (persist_exists(PERSIST_KEY_TEXT_OUTLINE_COLOR)) {
+    s_text_outline_color_argb = (uint8_t)persist_read_int(PERSIST_KEY_TEXT_OUTLINE_COLOR);
+  }
+  if (persist_exists(PERSIST_KEY_HANDS_COLOR)) {
+    s_hands_color_argb = (uint8_t)persist_read_int(PERSIST_KEY_HANDS_COLOR);
+  }
+  if (persist_exists(PERSIST_KEY_HANDS_OUTLINE_COLOR)) {
+    s_hands_outline_color_argb = (uint8_t)persist_read_int(PERSIST_KEY_HANDS_OUTLINE_COLOR);
+  }
+  if (persist_exists(PERSIST_KEY_HANDS_THICKNESS)) {
+    int v = persist_read_int(PERSIST_KEY_HANDS_THICKNESS);
+    if (v >= 0 && v <= 2) s_hands_thickness = (uint8_t)v;
+  }
+
+  APP_LOG(APP_LOG_LEVEL_INFO,
+          "Settings: embedded_rom=%d vibration=%d sound=%d vol=%d",
           (int)s_use_embedded_rom, (int)s_vibration_enabled,
           (int)s_sound_enabled, (int)s_sound_volume);
+  APP_LOG(APP_LOG_LEVEL_INFO,
+          "Customization: text_color=0x%02x outline=%d outline_color=0x%02x "
+          "hands=0x%02x hands_outline=0x%02x thickness=%d",
+          (int)s_text_color_argb, (int)s_text_outline_enabled,
+          (int)s_text_outline_color_argb,
+          (int)s_hands_color_argb, (int)s_hands_outline_color_argb,
+          (int)s_hands_thickness);
 }
 
 // Save current state to local watch storage (persist API). Synchronous,
