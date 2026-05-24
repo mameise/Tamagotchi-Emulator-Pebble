@@ -322,6 +322,38 @@ Pebble.addEventListener('webviewclosed',
         if (messageKeys.SoundVolume in dict) {
             settingsMsg['SoundVolume'] = parseInt(dict[messageKeys.SoundVolume], 10);
         }
+
+        // Color settings: Clay returns 24-bit RGB integers (e.g. 0xFFFFFF).
+        // Pebble's GColor.argb8 format is: bits 7-6 = alpha (always 11 for opaque),
+        // bits 5-4 = R (top 2 bits of 8-bit R), bits 3-2 = G, bits 1-0 = B.
+        function rgbToArgb8(rgb) {
+            if (rgb === null || rgb === undefined) return 0xFF; // default white
+            var r = (rgb >> 16) & 0xFF;
+            var g = (rgb >> 8) & 0xFF;
+            var b = rgb & 0xFF;
+            // Quantize each channel to 2 bits (top 2 bits)
+            return 0xC0 | ((r >> 6) << 4) | ((g >> 6) << 2) | (b >> 6);
+        }
+
+        if (messageKeys.TextColor in dict) {
+            settingsMsg['TextColor'] = rgbToArgb8(dict[messageKeys.TextColor]);
+        }
+        if (messageKeys.TextOutline in dict) {
+            settingsMsg['TextOutline'] = dict[messageKeys.TextOutline] ? 1 : 0;
+        }
+        if (messageKeys.TextOutlineColor in dict) {
+            settingsMsg['TextOutlineColor'] = rgbToArgb8(dict[messageKeys.TextOutlineColor]);
+        }
+        if (messageKeys.HandsColor in dict) {
+            settingsMsg['HandsColor'] = rgbToArgb8(dict[messageKeys.HandsColor]);
+        }
+        if (messageKeys.HandsOutlineColor in dict) {
+            settingsMsg['HandsOutlineColor'] = rgbToArgb8(dict[messageKeys.HandsOutlineColor]);
+        }
+        if (messageKeys.HandsThickness in dict) {
+            settingsMsg['HandsThickness'] = parseInt(dict[messageKeys.HandsThickness], 10);
+        }
+
         if (Object.keys(settingsMsg).length > 0) {
             console.log("Forwarding settings to watch: " + JSON.stringify(settingsMsg));
             Pebble.sendAppMessage(settingsMsg);

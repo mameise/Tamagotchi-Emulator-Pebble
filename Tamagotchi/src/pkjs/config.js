@@ -83,6 +83,65 @@ module.exports = [
     ]
   },
   {
+    "type": "section",
+    "items": [
+      {
+        "type": "heading",
+        "defaultValue": "Watchface customization (Pebble Time 2)"
+      },
+      {
+        "type": "text",
+        "defaultValue": "Change the colors of the clock face. Defaults: white text and hands with black outline."
+      },
+      {
+        "type": "color",
+        "messageKey": "TextColor",
+        "label": "Text color (time, date, battery)",
+        "defaultValue": "0xFFFFFF",
+        "sunlight": false
+      },
+      {
+        "type": "toggle",
+        "messageKey": "TextOutline",
+        "label": "Text outline",
+        "description": "Adds a contrasting outline around the text — helps readability over varied backgrounds.",
+        "defaultValue": true
+      },
+      {
+        "type": "color",
+        "messageKey": "TextOutlineColor",
+        "label": "Text outline color",
+        "defaultValue": "0x000000",
+        "sunlight": false
+      },
+      {
+        "type": "color",
+        "messageKey": "HandsColor",
+        "label": "Clock hands color",
+        "defaultValue": "0xFFFFFF",
+        "sunlight": false
+      },
+      {
+        "type": "color",
+        "messageKey": "HandsOutlineColor",
+        "label": "Clock hands outline color",
+        "defaultValue": "0x000000",
+        "sunlight": false
+      },
+      {
+        "type": "select",
+        "messageKey": "HandsThickness",
+        "label": "Clock hands thickness",
+        "defaultValue": "1",
+        "options": [
+          { "label": "Thin", "value": "0" },
+          { "label": "Normal", "value": "1" },
+          { "label": "Thick", "value": "2" }
+        ]
+      }
+    ]
+  },
+  {
     "type": "submit",
     "defaultValue": "Save"
   }
