@@ -1243,11 +1243,24 @@ static void rtc_sync_timer_callback(void *data)
 // One-shot timer callback: try local boot after init() returned and the
 // Pebble event loop is running. This avoids any lifecycle weirdness from
 // initializing tamalib/timers while still inside init().
+static const char* launch_reason_name(AppLaunchReason r) {
+  switch (r) {
+    case APP_LAUNCH_SYSTEM:           return "SYSTEM";
+    case APP_LAUNCH_USER:             return "USER";
+    case APP_LAUNCH_PHONE:            return "PHONE";
+    case APP_LAUNCH_WAKEUP:           return "WAKEUP";
+    case APP_LAUNCH_WORKER:           return "WORKER";
+    case APP_LAUNCH_QUICK_LAUNCH:     return "QUICK_LAUNCH";
+    case APP_LAUNCH_TIMELINE_ACTION:  return "TIMELINE_ACTION";
+    case APP_LAUNCH_SMARTSTRAP:       return "SMARTSTRAP";
+    default:                          return "UNKNOWN";
+  }
+}
+
 static void init() {
-  // Log why we (re)started — helps debug unexpected app restarts.
-  // APP_LAUNCH_TIMEOUT_TIMER_CANCELLED = OS killed us for inactivity/memory.
   AppLaunchReason reason = launch_reason();
-  APP_LOG(APP_LOG_LEVEL_INFO, "App launched. reason=%d", (int)reason);
+  APP_LOG(APP_LOG_LEVEL_INFO, "App launched. reason=%d (%s)",
+          (int)reason, launch_reason_name(reason));
 
   // --- Crash / lifecycle diagnostics ----------------------------------
   // Check if the previous run died unexpectedly: if last heartbeat is far in
@@ -1260,8 +1273,8 @@ static void init() {
       ? persist_read_int(PERSIST_KEY_LAST_LAUNCH_REASON)
       : APP_LAUNCH_SYSTEM;
     APP_LOG(APP_LOG_LEVEL_INFO,
-            "Diagnostics: last_heartbeat=%ds ago, last_launch_reason=%d",
-            gap_sec, (int)last_reason);
+            "Diagnostics: last_heartbeat=%ds ago, last_launch_reason=%d (%s)",
+            gap_sec, (int)last_reason, launch_reason_name(last_reason));
     // If the gap is more than ~7 minutes (we heartbeat every 5min),
     // count this as a crash.
     if (gap_sec > 7 * 60) {
@@ -1298,7 +1311,10 @@ static void init() {
     wakeup_cancel(old);
   }
   time_t wakeup_time = now + 5 * 60;  // 5 minutes from now
-  WakeupId wid = wakeup_schedule(wakeup_time, 0, false);
+  // notify_if_missed=true: if the watch was off (powered down, crashed,
+  // etc.) when the wakeup should have fired, fire it as soon as the watch
+  // is back online. Without this, missed wakeups are silently dropped.
+  WakeupId wid = wakeup_schedule(wakeup_time, 0, true);
   if (wid >= 0) {
     persist_write_int(PERSIST_KEY_WAKEUP_ID, wid);
     APP_LOG(APP_LOG_LEVEL_INFO, "Self-relaunch wakeup scheduled in 5min (id=%d)",
