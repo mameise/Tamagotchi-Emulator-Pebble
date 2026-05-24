@@ -25,6 +25,8 @@ static bool persistLoadState(void);
 static bool loadRomFromResource(void);
 static void loadSettingsFromPersist(void);
 static void autosave_timer_callback(void *data);
+static void update_clock_text(void);
+static void battery_handler(BatteryChargeState state);
 
 static Window *s_main_window;
 static BitmapLayer *s_background_layer;
