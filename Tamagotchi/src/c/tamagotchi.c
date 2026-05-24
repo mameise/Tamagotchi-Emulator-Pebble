@@ -28,6 +28,7 @@ static void autosave_timer_callback(void *data);
 
 static Window *s_main_window;
 static BitmapLayer *s_background_layer;
+static Layer *s_tama_bg_layer = NULL;  // white background behind Tama + icons (Emery)
 static Layer *s_screen_layer;
 static Layer *s_icons_layer;
 static Layer *s_hands_layer = NULL;  // analog clock hands (Emery)
@@ -473,8 +474,20 @@ static void icons_update_proc(Layer *layer, GContext *ctx) {
   }
 }
 
+// White background behind Tama LCD + menu icons (Emery only).
+// Gives the black Tama pixels and icons a visible canvas.
+static void tama_bg_update_proc(Layer *layer, GContext *ctx)
+{
+#if defined(PBL_PLATFORM_EMERY)
+  GRect bounds = layer_get_bounds(layer);
+  graphics_context_set_fill_color(ctx, GColorWhite);
+  graphics_fill_rect(ctx, bounds, 6, GCornersAll);  // slightly rounded corners
+#endif
+}
+
 // Analog clock hands (Emery only). Draws hour + minute hand rotating around
-// the screen center. Called via layer_mark_dirty whenever the time updates.
+// the screen center, with a black outline so they're visible over both the
+// black screen background and the white Tama-area background.
 static void hands_update_proc(Layer *layer, GContext *ctx)
 {
 #if defined(PBL_PLATFORM_EMERY)
@@ -488,40 +501,43 @@ static void hands_update_proc(Layer *layer, GContext *ctx)
   int hour = t->tm_hour % 12;
   int minute = t->tm_min;
 
-  // Angles in Pebble's TRIG_MAX_RATIO units (65536 = full circle)
-  // 12 o'clock = up = -90 degrees from standard math, but Pebble's trig has 0
-  // at "up" (north) by convention. Use TRIG_MAX_ANGLE / 12 per hour.
   int32_t hour_angle = TRIG_MAX_ANGLE * (hour * 60 + minute) / (12 * 60);
   int32_t min_angle  = TRIG_MAX_ANGLE * minute / 60;
 
-  // Hand lengths
   int hh_len = 38;
   int mh_len = 60;
 
-  // Hour hand endpoint
   GPoint hour_end = {
     .x = (int16_t)(sin_lookup(hour_angle) * hh_len / TRIG_MAX_RATIO) + center.x,
     .y = (int16_t)(-cos_lookup(hour_angle) * hh_len / TRIG_MAX_RATIO) + center.y,
   };
 
-  // Minute hand endpoint
   GPoint min_end = {
     .x = (int16_t)(sin_lookup(min_angle) * mh_len / TRIG_MAX_RATIO) + center.x,
     .y = (int16_t)(-cos_lookup(min_angle) * mh_len / TRIG_MAX_RATIO) + center.y,
   };
 
+  // Outlined hands: draw thick BLACK underneath, then thinner WHITE on top.
+  // Hour hand
+  graphics_context_set_stroke_color(ctx, GColorBlack);
+  graphics_context_set_stroke_width(ctx, 6);
+  graphics_draw_line(ctx, center, hour_end);
   graphics_context_set_stroke_color(ctx, GColorWhite);
-  graphics_context_set_fill_color(ctx, GColorWhite);
-
-  // Hour hand: thick
   graphics_context_set_stroke_width(ctx, 4);
   graphics_draw_line(ctx, center, hour_end);
 
-  // Minute hand: thinner
+  // Minute hand
+  graphics_context_set_stroke_color(ctx, GColorBlack);
+  graphics_context_set_stroke_width(ctx, 4);
+  graphics_draw_line(ctx, center, min_end);
+  graphics_context_set_stroke_color(ctx, GColorWhite);
   graphics_context_set_stroke_width(ctx, 2);
   graphics_draw_line(ctx, center, min_end);
 
-  // Center dot
+  // Center dot: black ring around white center
+  graphics_context_set_fill_color(ctx, GColorBlack);
+  graphics_fill_circle(ctx, center, 5);
+  graphics_context_set_fill_color(ctx, GColorWhite);
   graphics_fill_circle(ctx, center, 3);
 #endif
 }
@@ -887,10 +903,15 @@ static void main_window_load(Window *window) {
   layer_add_child(window_layer, bitmap_layer_get_layer(s_background_layer));
 
 #if defined(PBL_PLATFORM_EMERY)
-  // Create analog clock hands layer (covers full screen, transparent)
-  s_hands_layer = layer_create(GRect(0, 0, 200, 228));
-  layer_set_update_proc(s_hands_layer, hands_update_proc);
-  layer_add_child(window_layer, s_hands_layer);
+  // White background rectangle behind the Tama LCD + menu icons area.
+  // Covers from the top menu icons row down to bottom menu icons row.
+  // Icons: y=118..140 (above), Tama: y=142..174, icons: y=176..198
+  // So total area: y=114..202, with margin: y=110..206
+  // Horizontal: icons stretch from x=41 to x=158 (4 icons of 27px + 3 gaps of 3px)
+  // Add margin: x=35..165
+  s_tama_bg_layer = layer_create(GRect(35, 110, 130, 96));
+  layer_set_update_proc(s_tama_bg_layer, tama_bg_update_proc);
+  layer_add_child(window_layer, s_tama_bg_layer);
 #endif
 
   // Create bitmaps for icons
@@ -1024,6 +1045,14 @@ static void main_window_load(Window *window) {
   update_clock_text();
   s_clock_timer = app_timer_register(30 * 1000, clock_timer_callback, NULL);
 
+#if defined(PBL_PLATFORM_EMERY)
+  // Analog clock hands — added LAST so they draw on top of everything
+  // (tama LCD, icons, text). This way they're visible across the whole face.
+  s_hands_layer = layer_create(GRect(0, 0, 200, 228));
+  layer_set_update_proc(s_hands_layer, hands_update_proc);
+  layer_add_child(window_layer, s_hands_layer);
+#endif
+
   // Sub to ticks
   milli_tick_handler = app_timer_register(STEP_DELAY, milli_tick, NULL);
   screen_tick_handler = app_timer_register(FPS_DELAY, screen_tick, NULL);
@@ -1053,6 +1082,10 @@ static void main_window_unload(Window *window) {
   if (s_hands_layer) {
     layer_destroy(s_hands_layer);
     s_hands_layer = NULL;
+  }
+  if (s_tama_bg_layer) {
+    layer_destroy(s_tama_bg_layer);
+    s_tama_bg_layer = NULL;
   }
 
   // Destroy backrgound bitmap and its layer
