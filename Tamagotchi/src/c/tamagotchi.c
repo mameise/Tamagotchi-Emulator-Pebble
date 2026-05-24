@@ -166,6 +166,9 @@ static void hal_update_screen(void) //since we're not using tamalib_mainloop we 
 
 static void hal_set_lcd_matrix(u8_t x, u8_t y, bool_t val)
 {
+  // Defensive bounds check — a stray value from tamalib could otherwise
+  // corrupt memory and trigger a kernel-level crash (full watch reboot).
+  if (x >= LCD_WIDTH || y >= LCD_HEIGHT) return;
   s_screen_buffer[y][x] = val;
   s_pixelsChanged = true;
 }
@@ -898,8 +901,14 @@ static void update_clock_text(void)
     layer_mark_dirty(s_hands_layer);
   }
 
-  // Heartbeat: record we're still alive. Used by next init() to detect crashes.
-  persist_write_int(PERSIST_KEY_LAST_HEARTBEAT_TS, now);
+  // Heartbeat: record we're still alive. Throttled to once every 5 minutes
+  // to avoid flash wear from persist writes — we only need this for crash
+  // diagnostics, which is OK with 5-min granularity.
+  static time_t s_last_heartbeat_write = 0;
+  if (now - s_last_heartbeat_write >= 5 * 60) {
+    persist_write_int(PERSIST_KEY_LAST_HEARTBEAT_TS, now);
+    s_last_heartbeat_write = now;
+  }
 }
 
 // Schedule the next clock update at the next minute boundary, so that the
@@ -1253,9 +1262,9 @@ static void init() {
     APP_LOG(APP_LOG_LEVEL_INFO,
             "Diagnostics: last_heartbeat=%ds ago, last_launch_reason=%d",
             gap_sec, (int)last_reason);
-    // If the gap is more than ~3 minutes (we heartbeat every 60s) and we
-    // weren't expecting a clean exit, count this as a crash.
-    if (gap_sec > 180) {
+    // If the gap is more than ~7 minutes (we heartbeat every 5min),
+    // count this as a crash.
+    if (gap_sec > 7 * 60) {
       int crash_count = persist_exists(PERSIST_KEY_CRASH_COUNT)
         ? persist_read_int(PERSIST_KEY_CRASH_COUNT) : 0;
       crash_count++;
@@ -1269,23 +1278,30 @@ static void init() {
   persist_write_int(PERSIST_KEY_LAST_LAUNCH_REASON, reason);
   persist_write_int(PERSIST_KEY_LAST_HEARTBEAT_TS, now);
 
+  // Log heap usage at startup so we can spot memory issues over time.
+  APP_LOG(APP_LOG_LEVEL_INFO, "Heap at init: free=%u bytes used=%u bytes",
+          (unsigned)heap_bytes_free(), (unsigned)heap_bytes_used());
+
   // --- Self-relaunch via Wakeup API -----------------------------------
-  // Schedule a wakeup ~62 minutes from now. If the app is still running
-  // when the wakeup fires (the most common case), it's a no-op — the
-  // wakeup fires but we're already running. If the app has crashed in the
-  // meantime, the OS will re-launch us. This gives us automatic recovery
-  // within ~60 minutes of any crash.
-  // The Pebble Wakeup API allows at most 8 scheduled wakeups; we cancel
-  // any previously-scheduled one first to avoid hitting that limit.
+  // Schedule a wakeup 5 minutes from now. If the app is still running
+  // when the wakeup fires, it's effectively a no-op (we don't subscribe
+  // to the wakeup_handler, so there's no in-app event). If the app has
+  // crashed in the meantime, the OS will re-launch us. This gives us
+  // automatic recovery within ~5 minutes of any crash.
+  //
+  // Each init() re-schedules the next wakeup, so as long as the app is
+  // alive, it keeps pushing recovery checks ~5 min into the future.
+  // We cancel the previously-scheduled one first to avoid hitting the
+  // 8-simultaneous-wakeups limit.
   if (persist_exists(PERSIST_KEY_WAKEUP_ID)) {
     WakeupId old = persist_read_int(PERSIST_KEY_WAKEUP_ID);
     wakeup_cancel(old);
   }
-  time_t wakeup_time = now + 62 * 60;  // 62 minutes from now
+  time_t wakeup_time = now + 5 * 60;  // 5 minutes from now
   WakeupId wid = wakeup_schedule(wakeup_time, 0, false);
   if (wid >= 0) {
     persist_write_int(PERSIST_KEY_WAKEUP_ID, wid);
-    APP_LOG(APP_LOG_LEVEL_INFO, "Self-relaunch wakeup scheduled in 62min (id=%d)",
+    APP_LOG(APP_LOG_LEVEL_INFO, "Self-relaunch wakeup scheduled in 5min (id=%d)",
             (int)wid);
   } else {
     APP_LOG(APP_LOG_LEVEL_WARNING, "wakeup_schedule failed: %d", (int)wid);
@@ -1712,6 +1728,19 @@ static void deinit() {
     app_timer_cancel(s_rtc_sync_timer);
     s_rtc_sync_timer = NULL;
   }
+
+  // Clean exit — user closed the app. Cancel the pending self-relaunch
+  // wakeup so we don't pop back open in ~5 minutes against the user's wish.
+  if (persist_exists(PERSIST_KEY_WAKEUP_ID)) {
+    WakeupId wid = persist_read_int(PERSIST_KEY_WAKEUP_ID);
+    wakeup_cancel(wid);
+    persist_delete(PERSIST_KEY_WAKEUP_ID);
+    APP_LOG(APP_LOG_LEVEL_INFO, "Clean exit: cancelled self-relaunch wakeup");
+  }
+
+  // Update heartbeat to "now" so the next start doesn't mistake a clean
+  // exit for a crash.
+  persist_write_int(PERSIST_KEY_LAST_HEARTBEAT_TS, time(NULL));
 
   window_destroy(s_main_window);
 
