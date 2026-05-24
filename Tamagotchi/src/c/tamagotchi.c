@@ -993,8 +993,8 @@ static void main_window_load(Window *window) {
   // Digital time: centered, between top hour markers (12 row) and middle.
   // Battery + Date: in the band BELOW that, ABOVE the analog hand area.
   s_time_layer    = text_layer_create(GRect(0,   26, 200, 30));
-  s_battery_layer = text_layer_create(GRect(20,  62,  80, 20));
-  s_date_layer    = text_layer_create(GRect(100, 62,  80, 20));
+  s_battery_layer = text_layer_create(GRect(35,  62,  70, 20));
+  s_date_layer    = text_layer_create(GRect(95,  62,  85, 20));
   GFont time_font    = fonts_get_system_font(FONT_KEY_GOTHIC_28_BOLD);
   GFont small_font   = fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD);
 #elif defined(PBL_PLATFORM_CHALK)
