@@ -892,11 +892,36 @@ static void update_clock_text(void)
   }
 }
 
+// Schedule the next clock update at the next minute boundary, so that the
+// digital time stays in sync with the analog hands (both reflect the actual
+// minute, not a 30s-offset version).
+static void schedule_next_clock_update(void);
+
 static void clock_timer_callback(void *data)
 {
   s_clock_timer = NULL;
   update_clock_text();
-  s_clock_timer = app_timer_register(30 * 1000, clock_timer_callback, NULL);
+  schedule_next_clock_update();
+}
+
+static void schedule_next_clock_update(void)
+{
+  time_t now = time(NULL);
+  struct tm *t = localtime(&now);
+  if (!t) {
+    // Fallback if localtime fails — try again in 30s
+    s_clock_timer = app_timer_register(30 * 1000, clock_timer_callback, NULL);
+    return;
+  }
+  // Milliseconds remaining until the next full minute.
+  // localtime gives us seconds 0..59 of the current minute.
+  int seconds_into_minute = t->tm_sec;
+  uint32_t ms_until_next_minute = (60 - seconds_into_minute) * 1000;
+  // Add a tiny 100ms safety buffer so we fire just AFTER the minute change,
+  // not right on it (avoids edge cases where seconds == 0 means we just
+  // missed the tick).
+  if (ms_until_next_minute < 100) ms_until_next_minute = 100;
+  s_clock_timer = app_timer_register(ms_until_next_minute, clock_timer_callback, NULL);
 }
 
 // Battery indicator: small text at bottom of screen showing percent + charging.
@@ -1077,7 +1102,7 @@ static void main_window_load(Window *window) {
   battery_state_service_subscribe(battery_handler);
   battery_handler(battery_state_service_peek());
   update_clock_text();
-  s_clock_timer = app_timer_register(30 * 1000, clock_timer_callback, NULL);
+  schedule_next_clock_update();
 
 #if defined(PBL_PLATFORM_EMERY)
   // Analog clock hands — added LAST so they draw on top of everything
