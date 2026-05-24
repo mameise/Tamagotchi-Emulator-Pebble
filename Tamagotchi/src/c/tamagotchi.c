@@ -79,6 +79,13 @@ static AppTimer *screen_tick_handler;
 // Persistent settings keys (separate from save-state keys)
 #define PERSIST_KEY_USE_EMBEDDED_ROM  200
 #define PERSIST_KEY_VIBRATION_ENABLED 201
+
+// Crash / lifecycle diagnostics keys
+#define PERSIST_KEY_LAST_LAUNCH_TS    300  // time_t of last init()
+#define PERSIST_KEY_LAST_HEARTBEAT_TS 301  // time_t updated every minute while running
+#define PERSIST_KEY_LAST_LAUNCH_REASON 302 // AppLaunchReason of last init
+#define PERSIST_KEY_CRASH_COUNT       303  // counter of detected crashes
+#define PERSIST_KEY_WAKEUP_ID         304  // WakeupId of next-scheduled self-relaunch
 #define PERSIST_KEY_SOUND_ENABLED     202
 #define PERSIST_KEY_SOUND_VOLUME      203
 
@@ -890,6 +897,9 @@ static void update_clock_text(void)
   if (s_hands_layer) {
     layer_mark_dirty(s_hands_layer);
   }
+
+  // Heartbeat: record we're still alive. Used by next init() to detect crashes.
+  persist_write_int(PERSIST_KEY_LAST_HEARTBEAT_TS, now);
 }
 
 // Schedule the next clock update at the next minute boundary, so that the
@@ -1227,7 +1237,59 @@ static void rtc_sync_timer_callback(void *data)
 static void init() {
   // Log why we (re)started — helps debug unexpected app restarts.
   // APP_LAUNCH_TIMEOUT_TIMER_CANCELLED = OS killed us for inactivity/memory.
-  APP_LOG(APP_LOG_LEVEL_INFO, "App launched. reason=%d", (int)launch_reason());
+  AppLaunchReason reason = launch_reason();
+  APP_LOG(APP_LOG_LEVEL_INFO, "App launched. reason=%d", (int)reason);
+
+  // --- Crash / lifecycle diagnostics ----------------------------------
+  // Check if the previous run died unexpectedly: if last heartbeat is far in
+  // the past but the previous launch wasn't a clean exit, we likely crashed.
+  time_t now = time(NULL);
+  if (persist_exists(PERSIST_KEY_LAST_HEARTBEAT_TS)) {
+    time_t last_hb = persist_read_int(PERSIST_KEY_LAST_HEARTBEAT_TS);
+    int gap_sec = (int)(now - last_hb);
+    AppLaunchReason last_reason = persist_exists(PERSIST_KEY_LAST_LAUNCH_REASON)
+      ? persist_read_int(PERSIST_KEY_LAST_LAUNCH_REASON)
+      : APP_LAUNCH_SYSTEM;
+    APP_LOG(APP_LOG_LEVEL_INFO,
+            "Diagnostics: last_heartbeat=%ds ago, last_launch_reason=%d",
+            gap_sec, (int)last_reason);
+    // If the gap is more than ~3 minutes (we heartbeat every 60s) and we
+    // weren't expecting a clean exit, count this as a crash.
+    if (gap_sec > 180) {
+      int crash_count = persist_exists(PERSIST_KEY_CRASH_COUNT)
+        ? persist_read_int(PERSIST_KEY_CRASH_COUNT) : 0;
+      crash_count++;
+      persist_write_int(PERSIST_KEY_CRASH_COUNT, crash_count);
+      APP_LOG(APP_LOG_LEVEL_WARNING,
+              "Detected likely crash (gap=%ds). Total crash count: %d",
+              gap_sec, crash_count);
+    }
+  }
+  persist_write_int(PERSIST_KEY_LAST_LAUNCH_TS, now);
+  persist_write_int(PERSIST_KEY_LAST_LAUNCH_REASON, reason);
+  persist_write_int(PERSIST_KEY_LAST_HEARTBEAT_TS, now);
+
+  // --- Self-relaunch via Wakeup API -----------------------------------
+  // Schedule a wakeup ~62 minutes from now. If the app is still running
+  // when the wakeup fires (the most common case), it's a no-op — the
+  // wakeup fires but we're already running. If the app has crashed in the
+  // meantime, the OS will re-launch us. This gives us automatic recovery
+  // within ~60 minutes of any crash.
+  // The Pebble Wakeup API allows at most 8 scheduled wakeups; we cancel
+  // any previously-scheduled one first to avoid hitting that limit.
+  if (persist_exists(PERSIST_KEY_WAKEUP_ID)) {
+    WakeupId old = persist_read_int(PERSIST_KEY_WAKEUP_ID);
+    wakeup_cancel(old);
+  }
+  time_t wakeup_time = now + 62 * 60;  // 62 minutes from now
+  WakeupId wid = wakeup_schedule(wakeup_time, 0, false);
+  if (wid >= 0) {
+    persist_write_int(PERSIST_KEY_WAKEUP_ID, wid);
+    APP_LOG(APP_LOG_LEVEL_INFO, "Self-relaunch wakeup scheduled in 62min (id=%d)",
+            (int)wid);
+  } else {
+    APP_LOG(APP_LOG_LEVEL_WARNING, "wakeup_schedule failed: %d", (int)wid);
+  }
 
   // Create main Window element and assign to pointer
   s_main_window = window_create();
