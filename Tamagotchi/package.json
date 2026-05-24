@@ -48,7 +48,13 @@
             "UseEmbeddedRom",
             "VibrationEnabled",
             "SoundEnabled",
-            "SoundVolume"
+            "SoundVolume",
+            "TextColor",
+            "TextOutline",
+            "TextOutlineColor",
+            "HandsColor",
+            "HandsOutlineColor",
+            "HandsThickness"
         ],
         "projectType": "native",
         "resources": {
