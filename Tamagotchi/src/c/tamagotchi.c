@@ -181,6 +181,7 @@ static void hal_set_lcd_icon(u8_t icon, bool_t val)
     }
   }
   layer_mark_dirty(s_icons_layer);
+  if (s_tama_bg_layer) layer_mark_dirty(s_tama_bg_layer);
 }
 
 // Vibration on Tama buzzer activity. Goal: exactly one vibration when
@@ -475,13 +476,34 @@ static void icons_update_proc(Layer *layer, GContext *ctx) {
 }
 
 // White background behind Tama LCD + menu icons (Emery only).
-// Gives the black Tama pixels and icons a visible canvas.
+// Dynamic: small frame around just the Tama when no icons are shown,
+// extends up/down to cover menu icon rows when icons are active.
 static void tama_bg_update_proc(Layer *layer, GContext *ctx)
 {
 #if defined(PBL_PLATFORM_EMERY)
-  GRect bounds = layer_get_bounds(layer);
+  // Tama LCD is at absolute (68, 142, 64, 32) -> in this layer's coords
+  // (layer origin is at (35, 110)) -> (33, 32, 64, 32)
+  //
+  // Top icons row at absolute y=118..140 -> layer coords y=8..30
+  // Bottom icons row at absolute y=176..198 -> layer coords y=66..88
+
+  // Decide which "halves" to draw based on icon state
+  bool icon_top_active    = (s_selectedIcon >= 0 && s_selectedIcon <= 3);
+  bool icon_bottom_active = (s_selectedIcon >= 4 && s_selectedIcon <= 7);
+  bool attention_active   = s_showingAttentionIcon;
+  // Attention icon is drawn in the bottom row, so treat it like a bottom icon
+  bool need_top    = icon_top_active;
+  bool need_bottom = icon_bottom_active || attention_active;
+
+  // Base rect: just around the Tama LCD with a small margin
+  // Tama is at layer-coord (33, 32, 64, 32). Margin of 4px.
+  int top    = need_top    ? 4  : 28;  // 4 = covers icon row; 28 = just margin above tama
+  int bottom = need_bottom ? 92 : 68;  // 92 = covers bottom icon row; 68 = just margin below tama
+
+  GRect rect = GRect(29, top, 72, bottom - top);
+
   graphics_context_set_fill_color(ctx, GColorWhite);
-  graphics_fill_rect(ctx, bounds, 6, GCornersAll);  // slightly rounded corners
+  graphics_fill_rect(ctx, rect, 6, GCornersAll);
 #endif
 }
 
@@ -826,6 +848,7 @@ static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) 
       s_showingAttentionIcon = STATEshowing_attention_icon_t->value->int8;
 
       layer_mark_dirty(s_icons_layer);
+      if (s_tama_bg_layer) layer_mark_dirty(s_tama_bg_layer);
     }
 
     initTamalib();
