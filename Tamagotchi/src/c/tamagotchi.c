@@ -1,8 +1,11 @@
 #define bitRead(value, bit) (((value) >> (bit)) & 0x01)
-#define FPS 30
+#define FPS 20
 #define FPS_DELAY 1000/FPS //ms
 #define STEP_DELAY 1 //ms
-#define STEPS_PER_DELAY 600//55  
+// Slightly reduced from 600 to lower CPU load while keeping the Tama
+// running at near-correct speed. The Tama doesn't need 30fps either —
+// 20fps is plenty for an LCD this size and saves a few % CPU.
+#define STEPS_PER_DELAY 500
 
 #define VRAM_SIZE (64 + 13)
 #define BYTES_PER_LINE 32
