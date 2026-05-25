@@ -1499,8 +1499,10 @@ static void init() {
     int last_activity = persist_exists(PERSIST_KEY_LAST_ACTIVITY)
       ? persist_read_int(PERSIST_KEY_LAST_ACTIVITY) : 0;
     APP_LOG(APP_LOG_LEVEL_INFO,
-            "Diagnostics: last_heartbeat=%ds ago, last_launch_reason=%d (%s), last_activity=%d (%s)",
-            gap_sec, (int)last_reason, launch_reason_name(last_reason),
+            "Diagnostics: heartbeat_age=%ds last_reason=%d (%s)",
+            gap_sec, (int)last_reason, launch_reason_name(last_reason));
+    APP_LOG(APP_LOG_LEVEL_INFO,
+            "Diagnostics: last_activity=%d (%s)",
             last_activity, activity_name(last_activity));
     // If the gap is more than ~7 minutes (we heartbeat every 5min),
     // count this as a crash.
