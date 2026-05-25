@@ -1,11 +1,8 @@
 #define bitRead(value, bit) (((value) >> (bit)) & 0x01)
-#define FPS 20
+#define FPS 30
 #define FPS_DELAY 1000/FPS //ms
 #define STEP_DELAY 1 //ms
-// Slightly reduced from 600 to lower CPU load while keeping the Tama
-// running at near-correct speed. The Tama doesn't need 30fps either —
-// 20fps is plenty for an LCD this size and saves a few % CPU.
-#define STEPS_PER_DELAY 500
+#define STEPS_PER_DELAY 600
 
 #define VRAM_SIZE (64 + 13)
 #define BYTES_PER_LINE 32
@@ -72,7 +69,13 @@ static bool s_js_ready;
 static bool s_pixelsChanged = false;
 
 static bool_t s_screen_buffer[LCD_HEIGHT][LCD_WIDTH] = {{0}};
-static u12_t g_program[6144] = {0};
+// 8192 instead of 6144 — the Tama CPU's pc register is 13 bits (range 0..8191),
+// and tamalib's cpu_step does `op = g_program[pc]` without bounds checking.
+// If pc ever lands in the unused range (6144..8191), we'd be reading
+// out-of-bounds memory and triggering kernel-level crashes. Pad the buffer
+// to cover the full pc range; the extra entries are filled with zero, which
+// the CPU interprets as a no-op-ish instruction. Costs 4KB extra static RAM.
+static u12_t g_program[8192] = {0};
 static bool s_hasReceivedRom = false;
 static bool s_hasReceivedSaveFile = false;
 static bool s_loadedFromPersist = false;  // true if we already loaded state from local watch storage
