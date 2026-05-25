@@ -100,7 +100,8 @@ static AppTimer *screen_tick_handler;
 #define PERSIST_KEY_LAST_LAUNCH_REASON 302 // AppLaunchReason of last init
 #define PERSIST_KEY_CRASH_COUNT       303  // counter of detected crashes
 #define PERSIST_KEY_WAKEUP_ID         304  // WakeupId of next-scheduled self-relaunch
-#define PERSIST_KEY_LAST_ACTIVITY     305  // last "what was the app doing" marker
+#define PERSIST_KEY_LAST_ACTIVITY     305  // most recent "what was the app doing" marker
+#define PERSIST_KEY_PREV_ACTIVITY     306  // the marker BEFORE the current one
 
 // Activity markers — small ints indicating what the app was last doing.
 // Persisted regularly; on next start we can read this to see what was
@@ -133,17 +134,38 @@ static const char* activity_name(int a) {
   }
 }
 
-// Set activity marker, throttled to avoid hammering persist storage.
-// We only write if the marker actually changed AND not more than once per 10s.
+// Set activity marker. To balance flash wear vs diagnostic precision:
+//   - "hot loop" activities (TAMALIB_STEP, SCREEN_UPDATE) cycle very fast
+//     (multiple times per second). We track them in-memory and only flush
+//     once per ~10s.
+//   - "rare" activities (AUTOSAVE, RTC_SYNC, INBOX_*) are persisted
+//     immediately so we capture them precisely if a crash happens during one.
 static void set_activity(ActivityMarker act) {
   static int s_current_activity = -1;
-  static time_t s_last_activity_write = 0;
+  static int s_last_persisted_activity = -1;
+  static int s_prev_persisted_activity = -1;
+  static time_t s_last_persist_write = 0;
+
   if (act == s_current_activity) return;
-  time_t now = time(NULL);
-  if (now - s_last_activity_write < 10) return;
   s_current_activity = act;
-  s_last_activity_write = now;
-  persist_write_int(PERSIST_KEY_LAST_ACTIVITY, (int)act);
+
+  bool is_rare = (act == ACT_AUTOSAVE || act == ACT_RTC_SYNC ||
+                  act == ACT_INBOX_ROM || act == ACT_INBOX_STATE ||
+                  act == ACT_INBOX_SETTINGS || act == ACT_CLOCK_UPDATE);
+
+  time_t now = time(NULL);
+  if (is_rare || (now - s_last_persist_write >= 10)) {
+    if (act != s_last_persisted_activity) {
+      // Move current to previous before overwriting
+      if (s_last_persisted_activity >= 0) {
+        s_prev_persisted_activity = s_last_persisted_activity;
+        persist_write_int(PERSIST_KEY_PREV_ACTIVITY, s_prev_persisted_activity);
+      }
+      persist_write_int(PERSIST_KEY_LAST_ACTIVITY, (int)act);
+      s_last_persisted_activity = act;
+      s_last_persist_write = now;
+    }
+  }
 }
 #define PERSIST_KEY_SOUND_ENABLED     202
 #define PERSIST_KEY_SOUND_VOLUME      203
@@ -1498,12 +1520,15 @@ static void init() {
       : APP_LAUNCH_SYSTEM;
     int last_activity = persist_exists(PERSIST_KEY_LAST_ACTIVITY)
       ? persist_read_int(PERSIST_KEY_LAST_ACTIVITY) : 0;
+    int prev_activity = persist_exists(PERSIST_KEY_PREV_ACTIVITY)
+      ? persist_read_int(PERSIST_KEY_PREV_ACTIVITY) : 0;
     APP_LOG(APP_LOG_LEVEL_INFO,
             "Diagnostics: heartbeat_age=%ds last_reason=%d (%s)",
             gap_sec, (int)last_reason, launch_reason_name(last_reason));
     APP_LOG(APP_LOG_LEVEL_INFO,
-            "Diagnostics: last_activity=%d (%s)",
-            last_activity, activity_name(last_activity));
+            "Diagnostics: activity %d (%s) <- %d (%s)",
+            last_activity, activity_name(last_activity),
+            prev_activity, activity_name(prev_activity));
     // If the gap is more than ~7 minutes (we heartbeat every 5min),
     // count this as a crash.
     if (gap_sec > 7 * 60) {
