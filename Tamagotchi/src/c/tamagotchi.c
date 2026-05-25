@@ -100,6 +100,51 @@ static AppTimer *screen_tick_handler;
 #define PERSIST_KEY_LAST_LAUNCH_REASON 302 // AppLaunchReason of last init
 #define PERSIST_KEY_CRASH_COUNT       303  // counter of detected crashes
 #define PERSIST_KEY_WAKEUP_ID         304  // WakeupId of next-scheduled self-relaunch
+#define PERSIST_KEY_LAST_ACTIVITY     305  // last "what was the app doing" marker
+
+// Activity markers — small ints indicating what the app was last doing.
+// Persisted regularly; on next start we can read this to see what was
+// running when the crash happened.
+typedef enum {
+  ACT_NONE             = 0,
+  ACT_TAMALIB_STEP     = 1,
+  ACT_SCREEN_UPDATE    = 2,
+  ACT_AUTOSAVE         = 3,
+  ACT_RTC_SYNC         = 4,
+  ACT_INBOX_ROM        = 5,
+  ACT_INBOX_STATE      = 6,
+  ACT_INBOX_SETTINGS   = 7,
+  ACT_CLOCK_UPDATE     = 8,
+  ACT_HANDS_REDRAW     = 9,
+} ActivityMarker;
+
+static const char* activity_name(int a) {
+  switch (a) {
+    case ACT_TAMALIB_STEP:    return "TAMALIB_STEP";
+    case ACT_SCREEN_UPDATE:   return "SCREEN_UPDATE";
+    case ACT_AUTOSAVE:        return "AUTOSAVE";
+    case ACT_RTC_SYNC:        return "RTC_SYNC";
+    case ACT_INBOX_ROM:       return "INBOX_ROM";
+    case ACT_INBOX_STATE:     return "INBOX_STATE";
+    case ACT_INBOX_SETTINGS:  return "INBOX_SETTINGS";
+    case ACT_CLOCK_UPDATE:    return "CLOCK_UPDATE";
+    case ACT_HANDS_REDRAW:    return "HANDS_REDRAW";
+    default:                  return "NONE";
+  }
+}
+
+// Set activity marker, throttled to avoid hammering persist storage.
+// We only write if the marker actually changed AND not more than once per 10s.
+static void set_activity(ActivityMarker act) {
+  static int s_current_activity = -1;
+  static time_t s_last_activity_write = 0;
+  if (act == s_current_activity) return;
+  time_t now = time(NULL);
+  if (now - s_last_activity_write < 10) return;
+  s_current_activity = act;
+  s_last_activity_write = now;
+  persist_write_int(PERSIST_KEY_LAST_ACTIVITY, (int)act);
+}
 #define PERSIST_KEY_SOUND_ENABLED     202
 #define PERSIST_KEY_SOUND_VOLUME      203
 
@@ -357,6 +402,7 @@ static void milli_tick() //runs once every ms.
 {
   if (s_hasReceivedRom && s_hasReceivedSaveFile)
   {
+    set_activity(ACT_TAMALIB_STEP);
     for (size_t i = 0; i < STEPS_PER_DELAY; i++)
     {
         tamalib_step();
@@ -369,6 +415,7 @@ static void screen_tick() // runs every 33 ms for about 30fps
 {
   if (s_hasReceivedRom && s_hasReceivedSaveFile)
   {
+    set_activity(ACT_SCREEN_UPDATE);
     hal_update_screen();
   }
 
@@ -648,6 +695,7 @@ static void screen_update_proc(Layer *layer, GContext *ctx) {
 
 static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) {  
   APP_LOG(APP_LOG_LEVEL_DEBUG, "inbox received");
+  set_activity(ACT_INBOX_SETTINGS);
 
   Tuple *ready_tuple_t = dict_find(iter, MESSAGE_KEY_JSReady);
 
@@ -1044,6 +1092,7 @@ static void schedule_next_clock_update(void);
 static void clock_timer_callback(void *data)
 {
   s_clock_timer = NULL;
+  set_activity(ACT_CLOCK_UPDATE);
   update_clock_text();
   schedule_next_clock_update();
 }
@@ -1405,6 +1454,7 @@ static AppTimer *s_rtc_sync_timer = NULL;
 static void rtc_sync_timer_callback(void *data)
 {
   s_rtc_sync_timer = NULL;
+  set_activity(ACT_RTC_SYNC);
 
   if (s_hasReceivedRom && s_hasReceivedSaveFile) {
     tama_rtc_periodic_check();
@@ -1446,9 +1496,12 @@ static void init() {
     AppLaunchReason last_reason = persist_exists(PERSIST_KEY_LAST_LAUNCH_REASON)
       ? persist_read_int(PERSIST_KEY_LAST_LAUNCH_REASON)
       : APP_LAUNCH_SYSTEM;
+    int last_activity = persist_exists(PERSIST_KEY_LAST_ACTIVITY)
+      ? persist_read_int(PERSIST_KEY_LAST_ACTIVITY) : 0;
     APP_LOG(APP_LOG_LEVEL_INFO,
-            "Diagnostics: last_heartbeat=%ds ago, last_launch_reason=%d (%s)",
-            gap_sec, (int)last_reason, launch_reason_name(last_reason));
+            "Diagnostics: last_heartbeat=%ds ago, last_launch_reason=%d (%s), last_activity=%d (%s)",
+            gap_sec, (int)last_reason, launch_reason_name(last_reason),
+            last_activity, activity_name(last_activity));
     // If the gap is more than ~7 minutes (we heartbeat every 5min),
     // count this as a crash.
     if (gap_sec > 7 * 60) {
@@ -1745,10 +1798,11 @@ static void loadSettingsFromPersist(void)
           (int)s_use_embedded_rom, (int)s_vibration_enabled,
           (int)s_sound_enabled, (int)s_sound_volume);
   APP_LOG(APP_LOG_LEVEL_INFO,
-          "Customization: text_color=0x%02x outline=%d outline_color=0x%02x "
-          "hands=0x%02x hands_outline=0x%02x thickness=%d",
+          "Customization: text=0x%02x outline=%d/0x%02x",
           (int)s_text_color_argb, (int)s_text_outline_enabled,
-          (int)s_text_outline_color_argb,
+          (int)s_text_outline_color_argb);
+  APP_LOG(APP_LOG_LEVEL_INFO,
+          "Customization: hands=0x%02x/0x%02x thickness=%d",
           (int)s_hands_color_argb, (int)s_hands_outline_color_argb,
           (int)s_hands_thickness);
 }
@@ -1936,6 +1990,7 @@ static bool persistLoadState(void)
 static void autosave_timer_callback(void *data)
 {
   s_autosave_timer = NULL;
+  set_activity(ACT_AUTOSAVE);
 
   if (s_hasReceivedRom && s_hasReceivedSaveFile) {
     if (persistSaveState()) {
