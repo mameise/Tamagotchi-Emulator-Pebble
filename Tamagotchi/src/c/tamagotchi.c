@@ -1,8 +1,14 @@
 #define bitRead(value, bit) (((value) >> (bit)) & 0x01)
-#define FPS 30
+#define FPS 20
 #define FPS_DELAY 1000/FPS //ms
 #define STEP_DELAY 1 //ms
-#define STEPS_PER_DELAY 600//55  
+// Reduced from Stefan's 600 to lower CPU load — important for stability
+// on Pebble Time 2 (Emery), where high CPU load + backlight activation
+// can apparently cause a full watch reboot. The Tama CPU runs at ~32kHz
+// natively, so 300 steps/ms is still ~10x real-time. RTC sync periodically
+// nudges the clock back to reality so emulation speed doesn't have to
+// be precise. Less work per timer tick = lower peak power draw.
+#define STEPS_PER_DELAY 300
 
 #define VRAM_SIZE (64 + 13)
 #define BYTES_PER_LINE 32
@@ -25,11 +31,15 @@ static bool persistLoadState(void);
 static bool loadRomFromResource(void);
 static void loadSettingsFromPersist(void);
 static void autosave_timer_callback(void *data);
+static void update_clock_text(void);
+static void battery_handler(BatteryChargeState state);
 
 static Window *s_main_window;
 static BitmapLayer *s_background_layer;
+static Layer *s_tama_bg_layer = NULL;  // white background behind Tama + icons (Emery)
 static Layer *s_screen_layer;
 static Layer *s_icons_layer;
+static Layer *s_hands_layer = NULL;  // analog clock hands (Emery)
 static TextLayer *s_text_layer;
 static TextLayer *s_battery_layer = NULL;
 static char s_battery_text[8] = "";
@@ -37,6 +47,12 @@ static TextLayer *s_time_layer = NULL;
 static char s_time_text[8] = "";
 static TextLayer *s_date_layer = NULL;
 static char s_date_text[16] = "";
+
+// Shadow text layers used to fake an outline effect (4 offsets per text).
+// Only created on Emery — null on other platforms.
+static TextLayer *s_time_shadow[4]    = {NULL, NULL, NULL, NULL};
+static TextLayer *s_battery_shadow[4] = {NULL, NULL, NULL, NULL};
+static TextLayer *s_date_shadow[4]    = {NULL, NULL, NULL, NULL};
 //static GFont s_lcd_font;
 
 // Bitmaps
@@ -59,7 +75,13 @@ static bool s_js_ready;
 static bool s_pixelsChanged = false;
 
 static bool_t s_screen_buffer[LCD_HEIGHT][LCD_WIDTH] = {{0}};
-static u12_t g_program[6144] = {0};
+// 8192 instead of 6144 — the Tama CPU's pc register is 13 bits (range 0..8191),
+// and tamalib's cpu_step does `op = g_program[pc]` without bounds checking.
+// If pc ever lands in the unused range (6144..8191), we'd be reading
+// out-of-bounds memory and triggering kernel-level crashes. Pad the buffer
+// to cover the full pc range; the extra entries are filled with zero, which
+// the CPU interprets as a no-op-ish instruction. Costs 4KB extra static RAM.
+static u12_t g_program[8192] = {0};
 static bool s_hasReceivedRom = false;
 static bool s_hasReceivedSaveFile = false;
 static bool s_loadedFromPersist = false;  // true if we already loaded state from local watch storage
@@ -77,12 +99,110 @@ static AppTimer *screen_tick_handler;
 // Persistent settings keys (separate from save-state keys)
 #define PERSIST_KEY_USE_EMBEDDED_ROM  200
 #define PERSIST_KEY_VIBRATION_ENABLED 201
+#define PERSIST_KEY_TEXT_COLOR        204
+#define PERSIST_KEY_TEXT_OUTLINE      205
+#define PERSIST_KEY_TEXT_OUTLINE_COLOR 206
+#define PERSIST_KEY_HANDS_COLOR       207
+#define PERSIST_KEY_HANDS_OUTLINE_COLOR 208
+#define PERSIST_KEY_HANDS_THICKNESS   209
+
+// Crash / lifecycle diagnostics keys
+#define PERSIST_KEY_LAST_LAUNCH_TS    300  // time_t of last init()
+#define PERSIST_KEY_LAST_HEARTBEAT_TS 301  // time_t updated every minute while running
+#define PERSIST_KEY_LAST_LAUNCH_REASON 302 // AppLaunchReason of last init
+#define PERSIST_KEY_CRASH_COUNT       303  // counter of detected crashes
+#define PERSIST_KEY_WAKEUP_ID         304  // WakeupId of next-scheduled self-relaunch
+#define PERSIST_KEY_LAST_ACTIVITY     305  // most recent "what was the app doing" marker
+#define PERSIST_KEY_PREV_ACTIVITY     306  // the marker BEFORE the current one
+
+// Activity markers — small ints indicating what the app was last doing.
+// Persisted regularly; on next start we can read this to see what was
+// running when the crash happened.
+typedef enum {
+  ACT_NONE             = 0,
+  ACT_TAMALIB_STEP     = 1,
+  ACT_SCREEN_UPDATE    = 2,
+  ACT_AUTOSAVE         = 3,
+  ACT_RTC_SYNC         = 4,
+  ACT_INBOX_ROM        = 5,
+  ACT_INBOX_STATE      = 6,
+  ACT_INBOX_SETTINGS   = 7,
+  ACT_CLOCK_UPDATE     = 8,
+  ACT_HANDS_REDRAW     = 9,
+  // Finer-grained markers for individual render paths so we can pinpoint
+  // exactly which layer's update_proc was running when a crash happens.
+  ACT_DRAW_SCREEN_PROC = 10,
+  ACT_DRAW_HANDS_PROC  = 11,
+  ACT_DRAW_TAMA_BG     = 12,
+  ACT_DRAW_ICONS       = 13,
+} ActivityMarker;
+
+static const char* activity_name(int a) {
+  switch (a) {
+    case ACT_TAMALIB_STEP:     return "TAMALIB_STEP";
+    case ACT_SCREEN_UPDATE:    return "SCREEN_UPDATE";
+    case ACT_AUTOSAVE:         return "AUTOSAVE";
+    case ACT_RTC_SYNC:         return "RTC_SYNC";
+    case ACT_INBOX_ROM:        return "INBOX_ROM";
+    case ACT_INBOX_STATE:      return "INBOX_STATE";
+    case ACT_INBOX_SETTINGS:   return "INBOX_SETTINGS";
+    case ACT_CLOCK_UPDATE:     return "CLOCK_UPDATE";
+    case ACT_HANDS_REDRAW:     return "HANDS_REDRAW";
+    case ACT_DRAW_SCREEN_PROC: return "DRAW_SCREEN_PROC";
+    case ACT_DRAW_HANDS_PROC:  return "DRAW_HANDS_PROC";
+    case ACT_DRAW_TAMA_BG:     return "DRAW_TAMA_BG";
+    case ACT_DRAW_ICONS:       return "DRAW_ICONS";
+    default:                   return "NONE";
+  }
+}
+
+// Set activity marker. To balance flash wear vs diagnostic precision:
+//   - "hot loop" activities (TAMALIB_STEP, SCREEN_UPDATE) cycle very fast
+//     (multiple times per second). We track them in-memory and only flush
+//     once per ~10s.
+//   - "rare" activities (AUTOSAVE, RTC_SYNC, INBOX_*) are persisted
+//     immediately so we capture them precisely if a crash happens during one.
+// Set activity marker. We track the *most recent* activity in memory
+// (no flash write each frame), and periodically flush it to persist storage
+// every 10 seconds. On crash, the most recent flushed value tells us roughly
+// what the app was doing — accurate to within ~10s, which is enough to
+// pinpoint the problematic code path.
+static void set_activity(ActivityMarker act) {
+  static int s_current_activity = -1;
+  static int s_last_persisted_activity = -1;
+  static time_t s_last_persist_write = 0;
+
+  if (act == s_current_activity) return;
+  s_current_activity = act;
+
+  time_t now = time(NULL);
+  // Persist on every change, but throttle to once per 10s for flash wear
+  if (now - s_last_persist_write >= 10 && act != s_last_persisted_activity) {
+    // Track previous for diagnostics
+    if (s_last_persisted_activity >= 0) {
+      persist_write_int(PERSIST_KEY_PREV_ACTIVITY, s_last_persisted_activity);
+    }
+    persist_write_int(PERSIST_KEY_LAST_ACTIVITY, (int)act);
+    s_last_persisted_activity = act;
+    s_last_persist_write = now;
+  }
+}
 #define PERSIST_KEY_SOUND_ENABLED     202
 #define PERSIST_KEY_SOUND_VOLUME      203
 
 // Runtime settings — loaded from persist on startup, updated from Clay config.
 static bool s_use_embedded_rom  = true;
 static bool s_vibration_enabled = true;
+
+// Customization settings. Colors stored as Pebble's argb8 packed format
+// (1 byte). Defaults initialized to white text / black outline so even if
+// loadSettingsFromPersist hasn't run yet, the first render is sensible.
+static uint8_t s_text_color_argb         = 0xFF;  // GColorWhiteARGB8
+static uint8_t s_text_outline_color_argb = 0xC0;  // GColorBlackARGB8
+static bool    s_text_outline_enabled    = true;
+static uint8_t s_hands_color_argb        = 0xFF;
+static uint8_t s_hands_outline_color_argb = 0xC0;
+static uint8_t s_hands_thickness         = 1;  // 0=thin, 1=normal, 2=thick
 static bool s_sound_enabled     = false;  // OFF by default — opt-in feature
 static uint8_t s_sound_volume   = 60;
 
@@ -157,6 +277,9 @@ static void hal_update_screen(void) //since we're not using tamalib_mainloop we 
 
 static void hal_set_lcd_matrix(u8_t x, u8_t y, bool_t val)
 {
+  // Defensive bounds check — a stray value from tamalib could otherwise
+  // corrupt memory and trigger a kernel-level crash (full watch reboot).
+  if (x >= LCD_WIDTH || y >= LCD_HEIGHT) return;
   s_screen_buffer[y][x] = val;
   s_pixelsChanged = true;
 }
@@ -179,6 +302,7 @@ static void hal_set_lcd_icon(u8_t icon, bool_t val)
     }
   }
   layer_mark_dirty(s_icons_layer);
+  if (s_tama_bg_layer) layer_mark_dirty(s_tama_bg_layer);
 }
 
 // Vibration on Tama buzzer activity. Goal: exactly one vibration when
@@ -320,6 +444,7 @@ static void milli_tick() //runs once every ms.
 {
   if (s_hasReceivedRom && s_hasReceivedSaveFile)
   {
+    set_activity(ACT_TAMALIB_STEP);
     for (size_t i = 0; i < STEPS_PER_DELAY; i++)
     {
         tamalib_step();
@@ -332,6 +457,7 @@ static void screen_tick() // runs every 33 ms for about 30fps
 {
   if (s_hasReceivedRom && s_hasReceivedSaveFile)
   {
+    set_activity(ACT_SCREEN_UPDATE);
     hal_update_screen();
   }
 
@@ -399,6 +525,7 @@ static void click_config_provider(void *context) {
 
 // Handles drawing icons layers
 static void icons_update_proc(Layer *layer, GContext *ctx) {
+  set_activity(ACT_DRAW_ICONS);
   // Set the draw color
   graphics_context_set_fill_color(ctx, GColorBlack);
 
@@ -407,7 +534,13 @@ static void icons_update_proc(Layer *layer, GContext *ctx) {
 
   if(s_selectedIcon >= 0)
   {
-    #if defined(PBL_PLATFORM_EMERY) || defined(PBL_PLATFORM_GABBRO)
+    #if defined(PBL_PLATFORM_EMERY)
+    // New Emery layout: icons in 2 rows of 4, centered on screen.
+    // Row 0-3 above Tama (y=118), row 4-7 below Tama (y=176).
+    // Icon spacing: starting at x=41, step 30px (27 wide + 3 gap).
+    uint8_t xPos = 41 + ((s_selectedIcon % 4) * 30);
+    uint8_t yPos = (s_selectedIcon > 3 ? 176 : 118);
+    #elif defined(PBL_PLATFORM_GABBRO)
     uint8_t xPos = 12 + ((s_selectedIcon%4) * 40); 
     uint8_t yPos = (s_selectedIcon > 3 ? 120 : 0);
     #else
@@ -455,7 +588,10 @@ static void icons_update_proc(Layer *layer, GContext *ctx) {
   // Handle attention icon
   if(s_showingAttentionIcon)
   {
-    #if defined(PBL_PLATFORM_EMERY) || defined(PBL_PLATFORM_GABBRO)
+    #if defined(PBL_PLATFORM_EMERY)
+    // Show attention icon at the rightmost position in the bottom row
+    graphics_draw_bitmap_in_rect(ctx, s_bitmap_icon8, GRect(41 + 3*30, 176, 27, 22));
+    #elif defined(PBL_PLATFORM_GABBRO)
     graphics_draw_bitmap_in_rect(ctx, s_bitmap_icon8, GRect(12+(40*3), 120, 27, 22)); 
     #else
     graphics_draw_bitmap_in_rect(ctx, s_bitmap_icon8, GRect(108, 100, 22, 18));
@@ -463,8 +599,123 @@ static void icons_update_proc(Layer *layer, GContext *ctx) {
   }
 }
 
+// White background behind Tama LCD + menu icons (Emery only).
+// Dynamic: small frame around just the Tama when no icons are shown,
+// extends in height AND width to cover menu icon rows when icons are active.
+static void tama_bg_update_proc(Layer *layer, GContext *ctx)
+{
+#if defined(PBL_PLATFORM_EMERY)
+  set_activity(ACT_DRAW_TAMA_BG);
+  // Layer is at absolute (35, 110), size 130x96. Local coords:
+  //   Tama LCD at absolute (68, 142, 64, 32) -> local (33, 32, 64, 32)
+  //   Top icons at absolute y=118..140 -> local y=8..30
+  //   Bot icons at absolute y=176..198 -> local y=66..88
+  //   Icons span absolute x=41..158 (117px wide) -> local x=6..123
+
+  bool icon_top_active    = (s_selectedIcon >= 0 && s_selectedIcon <= 3);
+  bool icon_bottom_active = (s_selectedIcon >= 4 && s_selectedIcon <= 7);
+  bool attention_active   = s_showingAttentionIcon;
+  bool need_top    = icon_top_active;
+  bool need_bottom = icon_bottom_active || attention_active;
+  bool need_wide   = need_top || need_bottom;
+
+  // Vertical extent
+  int top    = need_top    ? 4  : 28;
+  int bottom = need_bottom ? 92 : 68;
+
+  // Horizontal extent: wide when icons are visible (cover all 4),
+  // narrow when just framing the Tama LCD
+  int left, right;
+  if (need_wide) {
+    // Cover icon row (local x=6..123) with a small margin
+    left  = 3;
+    right = 127;
+  } else {
+    // Just around the Tama (local x=33..97), with a 4px margin
+    left  = 29;
+    right = 101;
+  }
+
+  GRect rect = GRect(left, top, right - left, bottom - top);
+
+  graphics_context_set_fill_color(ctx, GColorWhite);
+  graphics_fill_rect(ctx, rect, 6, GCornersAll);
+#endif
+}
+
+// Analog clock hands (Emery only). Draws hour + minute hand rotating around
+// the screen center, with a black outline so they're visible over both the
+// black screen background and the white Tama-area background.
+static void hands_update_proc(Layer *layer, GContext *ctx)
+{
+#if defined(PBL_PLATFORM_EMERY)
+  set_activity(ACT_DRAW_HANDS_PROC);
+  GRect bounds = layer_get_bounds(layer);
+  GPoint center = GPoint(bounds.size.w / 2, bounds.size.h / 2);
+
+  time_t now = time(NULL);
+  struct tm *t = localtime(&now);
+  if (!t) return;
+
+  int hour = t->tm_hour % 12;
+  int minute = t->tm_min;
+
+  int32_t hour_angle = TRIG_MAX_ANGLE * (hour * 60 + minute) / (12 * 60);
+  int32_t min_angle  = TRIG_MAX_ANGLE * minute / 60;
+
+  int hh_len = 38;
+  int mh_len = 60;
+
+  GPoint hour_end = {
+    .x = (int16_t)(sin_lookup(hour_angle) * hh_len / TRIG_MAX_RATIO) + center.x,
+    .y = (int16_t)(-cos_lookup(hour_angle) * hh_len / TRIG_MAX_RATIO) + center.y,
+  };
+
+  GPoint min_end = {
+    .x = (int16_t)(sin_lookup(min_angle) * mh_len / TRIG_MAX_RATIO) + center.x,
+    .y = (int16_t)(-cos_lookup(min_angle) * mh_len / TRIG_MAX_RATIO) + center.y,
+  };
+
+  // Thickness presets — outline is always thickness+2 to give a visible border
+  int inner_thick_h, inner_thick_m;
+  switch (s_hands_thickness) {
+    case 0: inner_thick_h = 3; inner_thick_m = 1; break;
+    case 2: inner_thick_h = 6; inner_thick_m = 3; break;
+    default: inner_thick_h = 4; inner_thick_m = 2; break;
+  }
+  int outline_thick_h = inner_thick_h + 2;
+  int outline_thick_m = inner_thick_m + 2;
+
+  GColor hands_color    = (GColor){.argb = s_hands_color_argb};
+  GColor outline_color  = (GColor){.argb = s_hands_outline_color_argb};
+
+  // Hour hand: outline first, then inner color
+  graphics_context_set_stroke_color(ctx, outline_color);
+  graphics_context_set_stroke_width(ctx, outline_thick_h);
+  graphics_draw_line(ctx, center, hour_end);
+  graphics_context_set_stroke_color(ctx, hands_color);
+  graphics_context_set_stroke_width(ctx, inner_thick_h);
+  graphics_draw_line(ctx, center, hour_end);
+
+  // Minute hand
+  graphics_context_set_stroke_color(ctx, outline_color);
+  graphics_context_set_stroke_width(ctx, outline_thick_m);
+  graphics_draw_line(ctx, center, min_end);
+  graphics_context_set_stroke_color(ctx, hands_color);
+  graphics_context_set_stroke_width(ctx, inner_thick_m);
+  graphics_draw_line(ctx, center, min_end);
+
+  // Center dot
+  graphics_context_set_fill_color(ctx, outline_color);
+  graphics_fill_circle(ctx, center, 5);
+  graphics_context_set_fill_color(ctx, hands_color);
+  graphics_fill_circle(ctx, center, 3);
+#endif
+}
+
 // Handles drawing screen layer
 static void screen_update_proc(Layer *layer, GContext *ctx) { 
+  set_activity(ACT_DRAW_SCREEN_PROC);
   // draw new screen
   graphics_context_set_fill_color(ctx, GColorBlack);
 
@@ -475,7 +726,10 @@ static void screen_update_proc(Layer *layer, GContext *ctx) {
     {
       if (s_screen_buffer[h][w])
       {
-        #if defined(PBL_PLATFORM_EMERY) || defined(PBL_PLATFORM_GABBRO)
+        #if defined(PBL_PLATFORM_EMERY)
+        // 2x scale for Emery: 32x16 tama pixels -> 64x32 pebble pixels
+        graphics_fill_rect(ctx, GRect(w * 2, h * 2, 2, 2), 0, GCornerNone);
+        #elif defined(PBL_PLATFORM_GABBRO)
         graphics_fill_rect(ctx, GRect(w * 5, h * 5, 4, 4), 0, GCornerNone);
         #else
         graphics_fill_rect(ctx, GRect(w * 4, h * 4, 3, 3), 0, GCornerNone);
@@ -487,6 +741,7 @@ static void screen_update_proc(Layer *layer, GContext *ctx) {
 
 static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) {  
   APP_LOG(APP_LOG_LEVEL_DEBUG, "inbox received");
+  set_activity(ACT_INBOX_SETTINGS);
 
   Tuple *ready_tuple_t = dict_find(iter, MESSAGE_KEY_JSReady);
 
@@ -552,7 +807,62 @@ static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) 
     persist_write_int(PERSIST_KEY_SOUND_VOLUME, v);
     APP_LOG(APP_LOG_LEVEL_INFO, "Settings: SoundVolume = %d", v);
   }
-  
+
+  // ---- Customization settings ----
+  bool customization_changed = false;
+
+  Tuple *text_color_t = dict_find(iter, MESSAGE_KEY_TextColor);
+  if (text_color_t) {
+    s_text_color_argb = (uint8_t)text_color_t->value->int32;
+    persist_write_int(PERSIST_KEY_TEXT_COLOR, s_text_color_argb);
+    customization_changed = true;
+    APP_LOG(APP_LOG_LEVEL_INFO, "Settings: TextColor = 0x%02x", (int)s_text_color_argb);
+  }
+  Tuple *text_outline_t = dict_find(iter, MESSAGE_KEY_TextOutline);
+  if (text_outline_t) {
+    s_text_outline_enabled = (text_outline_t->value->int32 != 0);
+    persist_write_bool(PERSIST_KEY_TEXT_OUTLINE, s_text_outline_enabled);
+    customization_changed = true;
+  }
+  Tuple *text_outline_color_t = dict_find(iter, MESSAGE_KEY_TextOutlineColor);
+  if (text_outline_color_t) {
+    s_text_outline_color_argb = (uint8_t)text_outline_color_t->value->int32;
+    persist_write_int(PERSIST_KEY_TEXT_OUTLINE_COLOR, s_text_outline_color_argb);
+    customization_changed = true;
+  }
+  Tuple *hands_color_t = dict_find(iter, MESSAGE_KEY_HandsColor);
+  if (hands_color_t) {
+    s_hands_color_argb = (uint8_t)hands_color_t->value->int32;
+    persist_write_int(PERSIST_KEY_HANDS_COLOR, s_hands_color_argb);
+    customization_changed = true;
+  }
+  Tuple *hands_outline_color_t = dict_find(iter, MESSAGE_KEY_HandsOutlineColor);
+  if (hands_outline_color_t) {
+    s_hands_outline_color_argb = (uint8_t)hands_outline_color_t->value->int32;
+    persist_write_int(PERSIST_KEY_HANDS_OUTLINE_COLOR, s_hands_outline_color_argb);
+    customization_changed = true;
+  }
+  Tuple *hands_thickness_t = dict_find(iter, MESSAGE_KEY_HandsThickness);
+  if (hands_thickness_t) {
+    int v = hands_thickness_t->value->int32;
+    if (v < 0) v = 0; else if (v > 2) v = 2;
+    s_hands_thickness = (uint8_t)v;
+    persist_write_int(PERSIST_KEY_HANDS_THICKNESS, v);
+    customization_changed = true;
+  }
+
+  if (customization_changed) {
+    // Re-render everything that uses these colors
+    if (s_hands_layer) layer_mark_dirty(s_hands_layer);
+    update_clock_text();  // re-renders time + date text layers
+    battery_handler(battery_state_service_peek());
+    APP_LOG(APP_LOG_LEVEL_INFO,
+            "Customization updated: text=0x%02x outline=%d/0x%02x hands=0x%02x/0x%02x thick=%d",
+            (int)s_text_color_argb, (int)s_text_outline_enabled,
+            (int)s_text_outline_color_argb,
+            (int)s_hands_color_argb, (int)s_hands_outline_color_argb,
+            (int)s_hands_thickness);
+  }
 
   // handle incoming rom
   Tuple *offset_t = dict_find(iter, MESSAGE_KEY_ROMOffset);
@@ -744,6 +1054,7 @@ static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) 
       s_showingAttentionIcon = STATEshowing_attention_icon_t->value->int8;
 
       layer_mark_dirty(s_icons_layer);
+      if (s_tama_bg_layer) layer_mark_dirty(s_tama_bg_layer);
     }
 
     initTamalib();
@@ -755,6 +1066,33 @@ static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) 
 // tick_timer_service issue we had earlier.
 static AppTimer *s_clock_timer = NULL;
 
+// Apply current customization (text color + outline) to a primary text
+// layer and its 4 shadow layers. Shadows are kept hidden when outline is
+// disabled.
+static void apply_text_layer_style(TextLayer *primary, TextLayer **shadows)
+{
+  if (!primary) return;
+  GColor fill = (GColor){.argb = s_text_color_argb};
+  GColor outline = (GColor){.argb = s_text_outline_color_argb};
+  text_layer_set_text_color(primary, fill);
+  if (shadows) {
+    for (int i = 0; i < 4; i++) {
+      if (!shadows[i]) continue;
+      text_layer_set_text_color(shadows[i], outline);
+      layer_set_hidden(text_layer_get_layer(shadows[i]), !s_text_outline_enabled);
+    }
+  }
+}
+
+// Mirror the text content from primary into all 4 shadow layers.
+static void sync_shadow_text(TextLayer **shadows, const char *text)
+{
+  if (!shadows) return;
+  for (int i = 0; i < 4; i++) {
+    if (shadows[i]) text_layer_set_text(shadows[i], text);
+  }
+}
+
 static void update_clock_text(void)
 {
   if (!s_time_layer || !s_date_layer) return;
@@ -765,17 +1103,64 @@ static void update_clock_text(void)
   // Time: HH:MM (24h)
   strftime(s_time_text, sizeof(s_time_text), "%H:%M", t);
   text_layer_set_text(s_time_layer, s_time_text);
+  sync_shadow_text(s_time_shadow, s_time_text);
 
   // Date: e.g. "Mo 21.05"
   strftime(s_date_text, sizeof(s_date_text), "%a %d.%m", t);
   text_layer_set_text(s_date_layer, s_date_text);
+  sync_shadow_text(s_date_shadow, s_date_text);
+
+  // Re-apply styling (in case colors changed via settings update)
+  apply_text_layer_style(s_time_layer,    s_time_shadow);
+  apply_text_layer_style(s_date_layer,    s_date_shadow);
+  apply_text_layer_style(s_battery_layer, s_battery_shadow);
+
+  // Trigger redraw of analog hands (Emery only)
+  if (s_hands_layer) {
+    layer_mark_dirty(s_hands_layer);
+  }
+
+  // Heartbeat: record we're still alive. Throttled to once every 5 minutes
+  // to avoid flash wear from persist writes — we only need this for crash
+  // diagnostics, which is OK with 5-min granularity.
+  static time_t s_last_heartbeat_write = 0;
+  if (now - s_last_heartbeat_write >= 5 * 60) {
+    persist_write_int(PERSIST_KEY_LAST_HEARTBEAT_TS, now);
+    s_last_heartbeat_write = now;
+  }
 }
+
+// Schedule the next clock update at the next minute boundary, so that the
+// digital time stays in sync with the analog hands (both reflect the actual
+// minute, not a 30s-offset version).
+static void schedule_next_clock_update(void);
 
 static void clock_timer_callback(void *data)
 {
   s_clock_timer = NULL;
+  set_activity(ACT_CLOCK_UPDATE);
   update_clock_text();
-  s_clock_timer = app_timer_register(30 * 1000, clock_timer_callback, NULL);
+  schedule_next_clock_update();
+}
+
+static void schedule_next_clock_update(void)
+{
+  time_t now = time(NULL);
+  struct tm *t = localtime(&now);
+  if (!t) {
+    // Fallback if localtime fails — try again in 30s
+    s_clock_timer = app_timer_register(30 * 1000, clock_timer_callback, NULL);
+    return;
+  }
+  // Milliseconds remaining until the next full minute.
+  // localtime gives us seconds 0..59 of the current minute.
+  int seconds_into_minute = t->tm_sec;
+  uint32_t ms_until_next_minute = (60 - seconds_into_minute) * 1000;
+  // Add a tiny 100ms safety buffer so we fire just AFTER the minute change,
+  // not right on it (avoids edge cases where seconds == 0 means we just
+  // missed the tick).
+  if (ms_until_next_minute < 100) ms_until_next_minute = 100;
+  s_clock_timer = app_timer_register(ms_until_next_minute, clock_timer_callback, NULL);
 }
 
 // Battery indicator: small text at bottom of screen showing percent + charging.
@@ -786,6 +1171,7 @@ static void battery_handler(BatteryChargeState state)
            state.is_charging ? "+" : "",
            (int)state.charge_percent);
   text_layer_set_text(s_battery_layer, s_battery_text);
+  sync_shadow_text(s_battery_shadow, s_battery_text);
 }
 
 static void main_window_load(Window *window) {
@@ -815,6 +1201,18 @@ static void main_window_load(Window *window) {
   // Add it as a child layer to the Window's root layer
   layer_add_child(window_layer, bitmap_layer_get_layer(s_background_layer));
 
+#if defined(PBL_PLATFORM_EMERY)
+  // White background rectangle behind the Tama LCD + menu icons area.
+  // Covers from the top menu icons row down to bottom menu icons row.
+  // Icons: y=118..140 (above), Tama: y=142..174, icons: y=176..198
+  // So total area: y=114..202, with margin: y=110..206
+  // Horizontal: icons stretch from x=41 to x=158 (4 icons of 27px + 3 gaps of 3px)
+  // Add margin: x=35..165
+  s_tama_bg_layer = layer_create(GRect(35, 110, 130, 96));
+  layer_set_update_proc(s_tama_bg_layer, tama_bg_update_proc);
+  layer_add_child(window_layer, s_tama_bg_layer);
+#endif
+
   // Create bitmaps for icons
   s_bitmap_icon1 = gbitmap_create_with_resource(RESOURCE_ID_ICON1);
   s_bitmap_icon2 = gbitmap_create_with_resource(RESOURCE_ID_ICON2);
@@ -831,7 +1229,8 @@ static void main_window_load(Window *window) {
 #elif defined(PBL_PLATFORM_GABBRO) 
   s_icons_layer = layer_create(GRect(0+45, 60, 180, 183)); 
 #elif defined(PBL_PLATFORM_EMERY)
-  s_icons_layer = layer_create(GRect(0+15, 44, 180, 183)); 
+  // Icons layer covers most of the screen so we can use absolute-ish coords inside
+  s_icons_layer = layer_create(GRect(0, 0, 200, 228)); 
 #else
   s_icons_layer = layer_create(GRect(0, 24, 144, 146));
 #endif
@@ -846,7 +1245,10 @@ static void main_window_load(Window *window) {
 #elif defined(PBL_PLATFORM_GABBRO)
   s_screen_layer = layer_create(GRect(50, 92, 160, 80));
 #elif defined(PBL_PLATFORM_EMERY)
-  s_screen_layer = layer_create(GRect(20, 76, 160, 80));
+  // New Emery layout: tama LCD 2x scaled (64x32), centered horizontally,
+  // positioned in the bottom half. Surrounded by hour markers, menu icons,
+  // and analog clock hands.
+  s_screen_layer = layer_create(GRect(68, 142, 64, 32));
 #else
   s_screen_layer = layer_create(GRect(8, 51, 128, 64));
 #endif
@@ -864,7 +1266,7 @@ static void main_window_load(Window *window) {
   #elif defined(PBL_PLATFORM_GABBRO)
   s_text_layer = text_layer_create(GRect(50, 60+46, 158, 50));
   #elif defined(PBL_PLATFORM_EMERY)
-  s_text_layer = text_layer_create(GRect(20, 60+30, 158, 50));
+  s_text_layer = text_layer_create(GRect(10, 100, 180, 30));
   #else   
   s_text_layer = text_layer_create(GRect(6, 60, 128, 50)); 
   #endif
@@ -886,12 +1288,14 @@ static void main_window_load(Window *window) {
   GFont time_font    = fonts_get_system_font(FONT_KEY_BITHAM_42_BOLD);
   GFont small_font   = fonts_get_system_font(FONT_KEY_GOTHIC_28_BOLD);
 #elif defined(PBL_PLATFORM_EMERY)
-  // Emery: 200x228, tama LCD at y=76-156
-  s_time_layer    = text_layer_create(GRect(8,   2, 110, 42));
-  s_battery_layer = text_layer_create(GRect(118, 8, 80, 30));
-  s_date_layer    = text_layer_create(GRect(10, 195, 180, 26));
-  GFont time_font    = fonts_get_system_font(FONT_KEY_BITHAM_34_MEDIUM_NUMBERS);
-  GFont small_font   = fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD);
+  // Pebble Time 2: 200x228 with clock face layout.
+  // Digital time: centered, between top hour markers (12 row) and middle.
+  // Battery + Date: in the band BELOW that, ABOVE the analog hand area.
+  s_time_layer    = text_layer_create(GRect(0,   26, 200, 30));
+  s_battery_layer = text_layer_create(GRect(35,  62,  70, 20));
+  s_date_layer    = text_layer_create(GRect(95,  62,  85, 20));
+  GFont time_font    = fonts_get_system_font(FONT_KEY_GOTHIC_28_BOLD);
+  GFont small_font   = fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD);
 #elif defined(PBL_PLATFORM_CHALK)
   // Round 180x180 — corners less useful, use top-center / bottom-center
   s_time_layer    = text_layer_create(GRect(10,   4, 80, 30));
@@ -911,25 +1315,82 @@ static void main_window_load(Window *window) {
   // Common style for all three. Time gets its own (bigger) font.
   text_layer_set_background_color(s_time_layer, GColorClear);
   text_layer_set_text_color(s_time_layer, GColorWhite);
+#if defined(PBL_PLATFORM_EMERY)
+  text_layer_set_text_alignment(s_time_layer, GTextAlignmentCenter);
+#else
   text_layer_set_text_alignment(s_time_layer, GTextAlignmentLeft);
+#endif
   text_layer_set_font(s_time_layer, time_font);
-  layer_add_child(window_layer, text_layer_get_layer(s_time_layer));
 
   TextLayer *small_infos[2] = { s_battery_layer, s_date_layer };
+#if defined(PBL_PLATFORM_EMERY)
+  // Emery: battery LEFT, date RIGHT
+  GTextAlignment small_aligns[2] = { GTextAlignmentLeft, GTextAlignmentRight };
+#else
   GTextAlignment small_aligns[2] = { GTextAlignmentRight, GTextAlignmentCenter };
+#endif
   for (int i = 0; i < 2; i++) {
     text_layer_set_background_color(small_infos[i], GColorClear);
     text_layer_set_text_color(small_infos[i], GColorWhite);
     text_layer_set_text_alignment(small_infos[i], small_aligns[i]);
     text_layer_set_font(small_infos[i], small_font);
+  }
+
+#if defined(PBL_PLATFORM_EMERY)
+  // Outline shadow layers for Emery: 4 offsets per text (NW, NE, SW, SE).
+  // We attach them FIRST so the primary text draws on top.
+  static const int OFF[4][2] = {{-1,-1},{1,-1},{-1,1},{1,1}};
+
+  TextLayer *primaries[3]      = { s_time_layer, s_battery_layer, s_date_layer };
+  TextLayer **shadow_arrays[3] = { s_time_shadow, s_battery_shadow, s_date_shadow };
+  GFont        fonts[3]        = { time_font, small_font, small_font };
+  GRect frames[3] = {
+    GRect(0,   26, 200, 30),
+    GRect(35,  62,  70, 20),
+    GRect(95,  62,  85, 20),
+  };
+  GTextAlignment aligns_em[3] = {
+    GTextAlignmentCenter, GTextAlignmentLeft, GTextAlignmentRight
+  };
+
+  for (int t = 0; t < 3; t++) {
+    for (int i = 0; i < 4; i++) {
+      GRect r = frames[t];
+      r.origin.x += OFF[i][0];
+      r.origin.y += OFF[i][1];
+      shadow_arrays[t][i] = text_layer_create(r);
+      text_layer_set_background_color(shadow_arrays[t][i], GColorClear);
+      text_layer_set_text_color(shadow_arrays[t][i], GColorBlack);
+      text_layer_set_text_alignment(shadow_arrays[t][i], aligns_em[t]);
+      text_layer_set_font(shadow_arrays[t][i], fonts[t]);
+      layer_add_child(window_layer, text_layer_get_layer(shadow_arrays[t][i]));
+    }
+  }
+  // primaries attached AFTER shadows so they draw on top
+  for (int t = 0; t < 3; t++) {
+    layer_add_child(window_layer, text_layer_get_layer(primaries[t]));
+  }
+#else
+  // Non-Emery platforms: simple attach in original order
+  layer_add_child(window_layer, text_layer_get_layer(s_time_layer));
+  for (int i = 0; i < 2; i++) {
     layer_add_child(window_layer, text_layer_get_layer(small_infos[i]));
   }
+#endif
 
   // Initial values + subscriptions
   battery_state_service_subscribe(battery_handler);
   battery_handler(battery_state_service_peek());
   update_clock_text();
-  s_clock_timer = app_timer_register(30 * 1000, clock_timer_callback, NULL);
+  schedule_next_clock_update();
+
+#if defined(PBL_PLATFORM_EMERY)
+  // Analog clock hands — added LAST so they draw on top of everything
+  // (tama LCD, icons, text). This way they're visible across the whole face.
+  s_hands_layer = layer_create(GRect(0, 0, 200, 228));
+  layer_set_update_proc(s_hands_layer, hands_update_proc);
+  layer_add_child(window_layer, s_hands_layer);
+#endif
 
   // Sub to ticks
   milli_tick_handler = app_timer_register(STEP_DELAY, milli_tick, NULL);
@@ -945,6 +1406,14 @@ static void main_window_unload(Window *window) {
 
   // Unsubscribe battery service
   battery_state_service_unsubscribe();
+
+  // Destroy shadow layers first (only created on Emery, NULL otherwise)
+  for (int i = 0; i < 4; i++) {
+    if (s_time_shadow[i])    { text_layer_destroy(s_time_shadow[i]);    s_time_shadow[i]    = NULL; }
+    if (s_battery_shadow[i]) { text_layer_destroy(s_battery_shadow[i]); s_battery_shadow[i] = NULL; }
+    if (s_date_shadow[i])    { text_layer_destroy(s_date_shadow[i]);    s_date_shadow[i]    = NULL; }
+  }
+
   if (s_battery_layer) {
     text_layer_destroy(s_battery_layer);
     s_battery_layer = NULL;
@@ -956,6 +1425,14 @@ static void main_window_unload(Window *window) {
   if (s_date_layer) {
     text_layer_destroy(s_date_layer);
     s_date_layer = NULL;
+  }
+  if (s_hands_layer) {
+    layer_destroy(s_hands_layer);
+    s_hands_layer = NULL;
+  }
+  if (s_tama_bg_layer) {
+    layer_destroy(s_tama_bg_layer);
+    s_tama_bg_layer = NULL;
   }
 
   // Destroy backrgound bitmap and its layer
@@ -1023,6 +1500,7 @@ static AppTimer *s_rtc_sync_timer = NULL;
 static void rtc_sync_timer_callback(void *data)
 {
   s_rtc_sync_timer = NULL;
+  set_activity(ACT_RTC_SYNC);
 
   if (s_hasReceivedRom && s_hasReceivedSaveFile) {
     tama_rtc_periodic_check();
@@ -1035,10 +1513,93 @@ static void rtc_sync_timer_callback(void *data)
 // One-shot timer callback: try local boot after init() returned and the
 // Pebble event loop is running. This avoids any lifecycle weirdness from
 // initializing tamalib/timers while still inside init().
+static const char* launch_reason_name(AppLaunchReason r) {
+  switch (r) {
+    case APP_LAUNCH_SYSTEM:           return "SYSTEM";
+    case APP_LAUNCH_USER:             return "USER";
+    case APP_LAUNCH_PHONE:            return "PHONE";
+    case APP_LAUNCH_WAKEUP:           return "WAKEUP";
+    case APP_LAUNCH_WORKER:           return "WORKER";
+    case APP_LAUNCH_QUICK_LAUNCH:     return "QUICK_LAUNCH";
+    case APP_LAUNCH_TIMELINE_ACTION:  return "TIMELINE_ACTION";
+    case APP_LAUNCH_SMARTSTRAP:       return "SMARTSTRAP";
+    default:                          return "UNKNOWN";
+  }
+}
+
 static void init() {
-  // Log why we (re)started — helps debug unexpected app restarts.
-  // APP_LAUNCH_TIMEOUT_TIMER_CANCELLED = OS killed us for inactivity/memory.
-  APP_LOG(APP_LOG_LEVEL_INFO, "App launched. reason=%d", (int)launch_reason());
+  AppLaunchReason reason = launch_reason();
+  APP_LOG(APP_LOG_LEVEL_INFO, "App launched. reason=%d (%s)",
+          (int)reason, launch_reason_name(reason));
+
+  // --- Crash / lifecycle diagnostics ----------------------------------
+  // Check if the previous run died unexpectedly: if last heartbeat is far in
+  // the past but the previous launch wasn't a clean exit, we likely crashed.
+  time_t now = time(NULL);
+  if (persist_exists(PERSIST_KEY_LAST_HEARTBEAT_TS)) {
+    time_t last_hb = persist_read_int(PERSIST_KEY_LAST_HEARTBEAT_TS);
+    int gap_sec = (int)(now - last_hb);
+    AppLaunchReason last_reason = persist_exists(PERSIST_KEY_LAST_LAUNCH_REASON)
+      ? persist_read_int(PERSIST_KEY_LAST_LAUNCH_REASON)
+      : APP_LAUNCH_SYSTEM;
+    int last_activity = persist_exists(PERSIST_KEY_LAST_ACTIVITY)
+      ? persist_read_int(PERSIST_KEY_LAST_ACTIVITY) : 0;
+    int prev_activity = persist_exists(PERSIST_KEY_PREV_ACTIVITY)
+      ? persist_read_int(PERSIST_KEY_PREV_ACTIVITY) : 0;
+    APP_LOG(APP_LOG_LEVEL_INFO,
+            "Diagnostics: heartbeat_age=%ds last_reason=%d (%s)",
+            gap_sec, (int)last_reason, launch_reason_name(last_reason));
+    APP_LOG(APP_LOG_LEVEL_INFO,
+            "Diagnostics: activity %d (%s) <- %d (%s)",
+            last_activity, activity_name(last_activity),
+            prev_activity, activity_name(prev_activity));
+    // If the gap is more than ~7 minutes (we heartbeat every 5min),
+    // count this as a crash.
+    if (gap_sec > 7 * 60) {
+      int crash_count = persist_exists(PERSIST_KEY_CRASH_COUNT)
+        ? persist_read_int(PERSIST_KEY_CRASH_COUNT) : 0;
+      crash_count++;
+      persist_write_int(PERSIST_KEY_CRASH_COUNT, crash_count);
+      APP_LOG(APP_LOG_LEVEL_WARNING,
+              "Detected likely crash (gap=%ds). Total crash count: %d",
+              gap_sec, crash_count);
+    }
+  }
+  persist_write_int(PERSIST_KEY_LAST_LAUNCH_TS, now);
+  persist_write_int(PERSIST_KEY_LAST_LAUNCH_REASON, reason);
+  persist_write_int(PERSIST_KEY_LAST_HEARTBEAT_TS, now);
+
+  // Log heap usage at startup so we can spot memory issues over time.
+  APP_LOG(APP_LOG_LEVEL_INFO, "Heap at init: free=%u bytes used=%u bytes",
+          (unsigned)heap_bytes_free(), (unsigned)heap_bytes_used());
+
+  // --- Self-relaunch via Wakeup API -----------------------------------
+  // Schedule a wakeup 5 minutes from now. If the app is still running
+  // when the wakeup fires, it's effectively a no-op (we don't subscribe
+  // to the wakeup_handler, so there's no in-app event). If the app has
+  // crashed in the meantime, the OS will re-launch us. This gives us
+  // automatic recovery within ~5 minutes of any crash.
+  //
+  // Each init() re-schedules the next wakeup, so as long as the app is
+  // alive, it keeps pushing recovery checks ~5 min into the future.
+  // We cancel the previously-scheduled one first to avoid hitting the
+  // 8-simultaneous-wakeups limit.
+  if (persist_exists(PERSIST_KEY_WAKEUP_ID)) {
+    WakeupId old = persist_read_int(PERSIST_KEY_WAKEUP_ID);
+    wakeup_cancel(old);
+  }
+  time_t wakeup_time = now + 5 * 60;  // 5 minutes from now
+  // notify_if_missed=true: if the watch was off (powered down, crashed,
+  // etc.) when the wakeup should have fired, fire it as soon as the watch
+  // is back online. Without this, missed wakeups are silently dropped.
+  WakeupId wid = wakeup_schedule(wakeup_time, 0, true);
+  if (wid >= 0) {
+    persist_write_int(PERSIST_KEY_WAKEUP_ID, wid);
+    APP_LOG(APP_LOG_LEVEL_INFO, "Self-relaunch wakeup scheduled in 5min (id=%d)",
+            (int)wid);
+  } else {
+    APP_LOG(APP_LOG_LEVEL_WARNING, "wakeup_schedule failed: %d", (int)wid);
+  }
 
   // Create main Window element and assign to pointer
   s_main_window = window_create();
@@ -1061,11 +1622,12 @@ static void init() {
   APP_LOG(APP_LOG_LEVEL_INFO, "Auto-save disabled");
 #endif
 
+  // Load user settings from persist BEFORE the window's main_window_load
+  // runs (it uses these settings when applying initial text/hands colors).
+  loadSettingsFromPersist();
+
   // Show the Window on the watch, with animated=true
   window_stack_push(s_main_window, true);
-
-  // Load user settings from persist before anything that depends on them
-  loadSettingsFromPersist();
 
   // Try local boot if enabled by user setting (default: on)
   if (s_use_embedded_rom) {
@@ -1253,9 +1815,47 @@ static void loadSettingsFromPersist(void)
     int v = persist_read_int(PERSIST_KEY_SOUND_VOLUME);
     if (v >= 0 && v <= 100) s_sound_volume = (uint8_t)v;
   }
-  APP_LOG(APP_LOG_LEVEL_INFO, "Settings: embedded_rom=%d vibration=%d sound=%d vol=%d",
+
+  // Customization: defaults are white text/hands with black outline
+  s_text_color_argb         = GColorWhiteARGB8;
+  s_text_outline_color_argb = GColorBlackARGB8;
+  s_hands_color_argb        = GColorWhiteARGB8;
+  s_hands_outline_color_argb = GColorBlackARGB8;
+  s_text_outline_enabled    = true;
+  s_hands_thickness         = 1;
+
+  if (persist_exists(PERSIST_KEY_TEXT_COLOR)) {
+    s_text_color_argb = (uint8_t)persist_read_int(PERSIST_KEY_TEXT_COLOR);
+  }
+  if (persist_exists(PERSIST_KEY_TEXT_OUTLINE)) {
+    s_text_outline_enabled = persist_read_bool(PERSIST_KEY_TEXT_OUTLINE);
+  }
+  if (persist_exists(PERSIST_KEY_TEXT_OUTLINE_COLOR)) {
+    s_text_outline_color_argb = (uint8_t)persist_read_int(PERSIST_KEY_TEXT_OUTLINE_COLOR);
+  }
+  if (persist_exists(PERSIST_KEY_HANDS_COLOR)) {
+    s_hands_color_argb = (uint8_t)persist_read_int(PERSIST_KEY_HANDS_COLOR);
+  }
+  if (persist_exists(PERSIST_KEY_HANDS_OUTLINE_COLOR)) {
+    s_hands_outline_color_argb = (uint8_t)persist_read_int(PERSIST_KEY_HANDS_OUTLINE_COLOR);
+  }
+  if (persist_exists(PERSIST_KEY_HANDS_THICKNESS)) {
+    int v = persist_read_int(PERSIST_KEY_HANDS_THICKNESS);
+    if (v >= 0 && v <= 2) s_hands_thickness = (uint8_t)v;
+  }
+
+  APP_LOG(APP_LOG_LEVEL_INFO,
+          "Settings: embedded_rom=%d vibration=%d sound=%d vol=%d",
           (int)s_use_embedded_rom, (int)s_vibration_enabled,
           (int)s_sound_enabled, (int)s_sound_volume);
+  APP_LOG(APP_LOG_LEVEL_INFO,
+          "Customization: text=0x%02x outline=%d/0x%02x",
+          (int)s_text_color_argb, (int)s_text_outline_enabled,
+          (int)s_text_outline_color_argb);
+  APP_LOG(APP_LOG_LEVEL_INFO,
+          "Customization: hands=0x%02x/0x%02x thickness=%d",
+          (int)s_hands_color_argb, (int)s_hands_outline_color_argb,
+          (int)s_hands_thickness);
 }
 
 // Save current state to local watch storage (persist API). Synchronous,
@@ -1264,7 +1864,16 @@ static bool persistSaveState(void)
 {
   if (!s_hasReceivedRom || !s_hasReceivedSaveFile) return false;
 
-  flat_state_t st = cpu_get_flat_state();
+  // Mark activity so we know if a crash happened during the save.
+  set_activity(ACT_AUTOSAVE);
+
+  // flat_state_t is ~520 bytes (incl. memory[]). Putting it on the stack
+  // during the save would put us close to Pebble's 8KB app-stack limit,
+  // especially since we're called from a timer callback inside the event
+  // loop which already has its own stack frames. Static storage avoids
+  // any chance of stack overflow.
+  static flat_state_t st;
+  st = cpu_get_flat_state();
 
   // Sanity check: refuse to save obviously-bad state
   if (st.pc == 0) {
@@ -1441,6 +2050,7 @@ static bool persistLoadState(void)
 static void autosave_timer_callback(void *data)
 {
   s_autosave_timer = NULL;
+  set_activity(ACT_AUTOSAVE);
 
   if (s_hasReceivedRom && s_hasReceivedSaveFile) {
     if (persistSaveState()) {
@@ -1461,6 +2071,19 @@ static void deinit() {
     app_timer_cancel(s_rtc_sync_timer);
     s_rtc_sync_timer = NULL;
   }
+
+  // Clean exit — user closed the app. Cancel the pending self-relaunch
+  // wakeup so we don't pop back open in ~5 minutes against the user's wish.
+  if (persist_exists(PERSIST_KEY_WAKEUP_ID)) {
+    WakeupId wid = persist_read_int(PERSIST_KEY_WAKEUP_ID);
+    wakeup_cancel(wid);
+    persist_delete(PERSIST_KEY_WAKEUP_ID);
+    APP_LOG(APP_LOG_LEVEL_INFO, "Clean exit: cancelled self-relaunch wakeup");
+  }
+
+  // Update heartbeat to "now" so the next start doesn't mistake a clean
+  // exit for a crash.
+  persist_write_int(PERSIST_KEY_LAST_HEARTBEAT_TS, time(NULL));
 
   window_destroy(s_main_window);
 
