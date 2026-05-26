@@ -81,16 +81,6 @@ static bool_t s_screen_buffer[LCD_HEIGHT][LCD_WIDTH] = {{0}};
 // the CPU interprets as a no-op-ish instruction. Costs 4KB extra static RAM.
 static u12_t g_program[8192] = {0};
 static bool s_hasReceivedRom = false;
-
-// Backlight-pause window: when the user shakes/taps the watch (which the
-// system uses to trigger the backlight), we briefly throttle our high-CPU
-// emulator steps. The critical phase is the ~200ms during which the
-// backlight LED ramps up — that's apparently when we collide with the
-// Pebble Time 2 hardware and trigger occasional full-watch reboots.
-// Value is `time(NULL)` of when the tap happened (milliseconds since boot
-// would be more accurate but we only have second-resolution time() here;
-// we use the AppTimer's relative timing instead — see milli_tick).
-static volatile uint32_t s_tap_count = 0;  // incremented on each tap
 static bool s_hasReceivedSaveFile = false;
 static bool s_loadedFromPersist = false;  // true if we already loaded state from local watch storage
 static bool s_clearTextLayerOnScreenRefresh = false;
@@ -450,23 +440,6 @@ void set_screen_to_last_state(uint8_t *fullRam) { // gets screen data from memor
 
 static void milli_tick() //runs once every ms.
 {
-  // Tap-aware throttling: when accel_tap_handler bumps s_tap_count, we
-  // skip the next few emulator bursts. Each milli_tick is ~1ms, so
-  // skipping 10 ticks gives the watch a ~10ms gap to handle the backlight
-  // ramp-up without colliding with our high-CPU bursts. Imperceptible to
-  // the user but apparently enough to prevent the crash.
-  static uint32_t s_last_handled_tap = 0;
-  static int s_skip_remaining = 0;
-  if (s_tap_count != s_last_handled_tap) {
-    s_last_handled_tap = s_tap_count;
-    s_skip_remaining = 10;  // 10 ms of "do nothing"
-  }
-  if (s_skip_remaining > 0) {
-    s_skip_remaining--;
-    milli_tick_handler = app_timer_register(STEP_DELAY, milli_tick, NULL);
-    return;
-  }
-
   if (s_hasReceivedRom && s_hasReceivedSaveFile)
   {
     set_activity(ACT_TAMALIB_STEP);
@@ -478,20 +451,12 @@ static void milli_tick() //runs once every ms.
   milli_tick_handler = app_timer_register(STEP_DELAY, milli_tick, NULL); // calls itself in 1ms
 }
 
-static void screen_tick() // runs every FPS_DELAY ms
+static void screen_tick() // runs every 33 ms for about 30fps
 {
   if (s_hasReceivedRom && s_hasReceivedSaveFile)
   {
-    // Only mark the Tama LCD dirty if pixels actually changed since the
-    // last redraw. The Tama LCD is mostly static between visual events,
-    // so this avoids the full layer-redraw cycle on every screen tick.
-    // This reduces peak CPU+display load, which appears to be a key
-    // factor in backlight-induced crashes on Pebble Time 2.
-    if (s_pixelsChanged) {
-      set_activity(ACT_SCREEN_UPDATE);
-      s_pixelsChanged = false;
-      layer_mark_dirty(s_screen_layer);
-    }
+    set_activity(ACT_SCREEN_UPDATE);
+    hal_update_screen();
   }
 
   if (s_clearTextLayerOnScreenRefresh)
@@ -1207,16 +1172,6 @@ static void battery_handler(BatteryChargeState state)
   sync_shadow_text(s_battery_shadow, s_battery_text);
 }
 
-// Accelerometer tap handler — the system uses these events to trigger the
-// backlight. By incrementing a counter, we signal milli_tick to skip a few
-// (very brief, ~5ms) emulator bursts during the backlight ramp-up. Doing
-// nothing for 5ms is imperceptible to the user but gives the hardware a
-// gap to handle the backlight transition without colliding with us.
-static void accel_tap_handler(AccelAxisType axis, int32_t direction)
-{
-  s_tap_count++;
-}
-
 static void main_window_load(Window *window) {
   // Get information about the Window
   Layer *window_layer = window_get_root_layer(window);
@@ -1425,9 +1380,6 @@ static void main_window_load(Window *window) {
   battery_state_service_subscribe(battery_handler);
   battery_handler(battery_state_service_peek());
 
-  // Subscribe to tap events so we can briefly throttle CPU during
-  // backlight ramp-up (which the same events trigger).
-  accel_tap_service_subscribe(accel_tap_handler);
   update_clock_text();
   schedule_next_clock_update();
 
@@ -1453,7 +1405,6 @@ static void main_window_unload(Window *window) {
 
   // Unsubscribe battery service
   battery_state_service_unsubscribe();
-  accel_tap_service_unsubscribe();
 
   // Destroy shadow layers first (only created on Emery, NULL otherwise)
   for (int i = 0; i < 4; i++) {
