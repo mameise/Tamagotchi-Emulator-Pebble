@@ -2,13 +2,13 @@
 #define FPS 20
 #define FPS_DELAY 1000/FPS //ms
 #define STEP_DELAY 1 //ms
-// Reduced from Stefan's 600 to lower CPU load — important for stability
-// on Pebble Time 2 (Emery), where high CPU load + backlight activation
-// can apparently cause a full watch reboot. The Tama CPU runs at ~32kHz
-// natively, so 300 steps/ms is still ~10x real-time. RTC sync periodically
-// nudges the clock back to reality so emulation speed doesn't have to
-// be precise. Less work per timer tick = lower peak power draw.
-#define STEPS_PER_DELAY 300
+// Reduced from Stefan's 600 to lower peak CPU load. On Pebble Time 2
+// (Emery), high CPU + backlight activation appears to cause occasional
+// full watch reboots. 200 steps/ms is still ~6x real-time for the
+// Tama CPU (which runs at ~32kHz natively). The RTC-sync periodically
+// nudges the Tama clock back to reality, so emulation speed doesn't
+// have to be precise. Lower steps = lower peak power draw per timer tick.
+#define STEPS_PER_DELAY 200
 
 #define VRAM_SIZE (64 + 13)
 #define BYTES_PER_LINE 32
@@ -453,12 +453,20 @@ static void milli_tick() //runs once every ms.
   milli_tick_handler = app_timer_register(STEP_DELAY, milli_tick, NULL); // calls itself in 1ms
 }
 
-static void screen_tick() // runs every 33 ms for about 30fps
+static void screen_tick() // runs every FPS_DELAY ms
 {
   if (s_hasReceivedRom && s_hasReceivedSaveFile)
   {
-    set_activity(ACT_SCREEN_UPDATE);
-    hal_update_screen();
+    // Only mark the Tama LCD dirty if pixels actually changed since the
+    // last redraw. The Tama LCD is mostly static between visual events,
+    // so this avoids the full layer-redraw cycle on every screen tick.
+    // This reduces peak CPU+display load, which appears to be a key
+    // factor in backlight-induced crashes on Pebble Time 2.
+    if (s_pixelsChanged) {
+      set_activity(ACT_SCREEN_UPDATE);
+      s_pixelsChanged = false;
+      layer_mark_dirty(s_screen_layer);
+    }
   }
 
   if (s_clearTextLayerOnScreenRefresh)
