@@ -2,10 +2,10 @@
 #define FPS 20
 #define FPS_DELAY 1000/FPS //ms
 #define STEP_DELAY 1 //ms
-// Reduced from Stefan's 600 to lower CPU load. The Tama CPU runs at ~32kHz
-// natively; even at 400 steps/ms the emulated CPU runs much faster than
-// needed. RTC sync periodically nudges the Tama clock back to reality so
-// emulation speed doesn't have to be precise.
+// Moderate reduction from Stefan's 600. CPU load itself isn't the main
+// crash cause (crashes happen even with very low load) — the issue is
+// CPU activity colliding with the backlight ramp-up on Pebble Time 2.
+// That's handled separately via the tap-aware throttling in milli_tick.
 #define STEPS_PER_DELAY 400
 
 #define VRAM_SIZE (64 + 13)
@@ -81,6 +81,16 @@ static bool_t s_screen_buffer[LCD_HEIGHT][LCD_WIDTH] = {{0}};
 // the CPU interprets as a no-op-ish instruction. Costs 4KB extra static RAM.
 static u12_t g_program[8192] = {0};
 static bool s_hasReceivedRom = false;
+
+// Backlight-pause window: when the user shakes/taps the watch (which the
+// system uses to trigger the backlight), we briefly throttle our high-CPU
+// emulator steps. The critical phase is the ~200ms during which the
+// backlight LED ramps up — that's apparently when we collide with the
+// Pebble Time 2 hardware and trigger occasional full-watch reboots.
+// Value is `time(NULL)` of when the tap happened (milliseconds since boot
+// would be more accurate but we only have second-resolution time() here;
+// we use the AppTimer's relative timing instead — see milli_tick).
+static volatile uint32_t s_tap_count = 0;  // incremented on each tap
 static bool s_hasReceivedSaveFile = false;
 static bool s_loadedFromPersist = false;  // true if we already loaded state from local watch storage
 static bool s_clearTextLayerOnScreenRefresh = false;
@@ -127,20 +137,30 @@ typedef enum {
   ACT_INBOX_SETTINGS   = 7,
   ACT_CLOCK_UPDATE     = 8,
   ACT_HANDS_REDRAW     = 9,
+  // Finer-grained markers for individual render paths so we can pinpoint
+  // exactly which layer's update_proc was running when a crash happens.
+  ACT_DRAW_SCREEN_PROC = 10,
+  ACT_DRAW_HANDS_PROC  = 11,
+  ACT_DRAW_TAMA_BG     = 12,
+  ACT_DRAW_ICONS       = 13,
 } ActivityMarker;
 
 static const char* activity_name(int a) {
   switch (a) {
-    case ACT_TAMALIB_STEP:    return "TAMALIB_STEP";
-    case ACT_SCREEN_UPDATE:   return "SCREEN_UPDATE";
-    case ACT_AUTOSAVE:        return "AUTOSAVE";
-    case ACT_RTC_SYNC:        return "RTC_SYNC";
-    case ACT_INBOX_ROM:       return "INBOX_ROM";
-    case ACT_INBOX_STATE:     return "INBOX_STATE";
-    case ACT_INBOX_SETTINGS:  return "INBOX_SETTINGS";
-    case ACT_CLOCK_UPDATE:    return "CLOCK_UPDATE";
-    case ACT_HANDS_REDRAW:    return "HANDS_REDRAW";
-    default:                  return "NONE";
+    case ACT_TAMALIB_STEP:     return "TAMALIB_STEP";
+    case ACT_SCREEN_UPDATE:    return "SCREEN_UPDATE";
+    case ACT_AUTOSAVE:         return "AUTOSAVE";
+    case ACT_RTC_SYNC:         return "RTC_SYNC";
+    case ACT_INBOX_ROM:        return "INBOX_ROM";
+    case ACT_INBOX_STATE:      return "INBOX_STATE";
+    case ACT_INBOX_SETTINGS:   return "INBOX_SETTINGS";
+    case ACT_CLOCK_UPDATE:     return "CLOCK_UPDATE";
+    case ACT_HANDS_REDRAW:     return "HANDS_REDRAW";
+    case ACT_DRAW_SCREEN_PROC: return "DRAW_SCREEN_PROC";
+    case ACT_DRAW_HANDS_PROC:  return "DRAW_HANDS_PROC";
+    case ACT_DRAW_TAMA_BG:     return "DRAW_TAMA_BG";
+    case ACT_DRAW_ICONS:       return "DRAW_ICONS";
+    default:                   return "NONE";
   }
 }
 
@@ -150,31 +170,29 @@ static const char* activity_name(int a) {
 //     once per ~10s.
 //   - "rare" activities (AUTOSAVE, RTC_SYNC, INBOX_*) are persisted
 //     immediately so we capture them precisely if a crash happens during one.
+// Set activity marker. We track the *most recent* activity in memory
+// (no flash write each frame), and periodically flush it to persist storage
+// every 10 seconds. On crash, the most recent flushed value tells us roughly
+// what the app was doing — accurate to within ~10s, which is enough to
+// pinpoint the problematic code path.
 static void set_activity(ActivityMarker act) {
   static int s_current_activity = -1;
   static int s_last_persisted_activity = -1;
-  static int s_prev_persisted_activity = -1;
   static time_t s_last_persist_write = 0;
 
   if (act == s_current_activity) return;
   s_current_activity = act;
 
-  bool is_rare = (act == ACT_AUTOSAVE || act == ACT_RTC_SYNC ||
-                  act == ACT_INBOX_ROM || act == ACT_INBOX_STATE ||
-                  act == ACT_INBOX_SETTINGS || act == ACT_CLOCK_UPDATE);
-
   time_t now = time(NULL);
-  if (is_rare || (now - s_last_persist_write >= 10)) {
-    if (act != s_last_persisted_activity) {
-      // Move current to previous before overwriting
-      if (s_last_persisted_activity >= 0) {
-        s_prev_persisted_activity = s_last_persisted_activity;
-        persist_write_int(PERSIST_KEY_PREV_ACTIVITY, s_prev_persisted_activity);
-      }
-      persist_write_int(PERSIST_KEY_LAST_ACTIVITY, (int)act);
-      s_last_persisted_activity = act;
-      s_last_persist_write = now;
+  // Persist on every change, but throttle to once per 10s for flash wear
+  if (now - s_last_persist_write >= 10 && act != s_last_persisted_activity) {
+    // Track previous for diagnostics
+    if (s_last_persisted_activity >= 0) {
+      persist_write_int(PERSIST_KEY_PREV_ACTIVITY, s_last_persisted_activity);
     }
+    persist_write_int(PERSIST_KEY_LAST_ACTIVITY, (int)act);
+    s_last_persisted_activity = act;
+    s_last_persist_write = now;
   }
 }
 #define PERSIST_KEY_SOUND_ENABLED     202
@@ -432,6 +450,23 @@ void set_screen_to_last_state(uint8_t *fullRam) { // gets screen data from memor
 
 static void milli_tick() //runs once every ms.
 {
+  // Tap-aware throttling: when accel_tap_handler bumps s_tap_count, we
+  // skip the next few emulator bursts. Each milli_tick is ~1ms, so
+  // skipping 10 ticks gives the watch a ~10ms gap to handle the backlight
+  // ramp-up without colliding with our high-CPU bursts. Imperceptible to
+  // the user but apparently enough to prevent the crash.
+  static uint32_t s_last_handled_tap = 0;
+  static int s_skip_remaining = 0;
+  if (s_tap_count != s_last_handled_tap) {
+    s_last_handled_tap = s_tap_count;
+    s_skip_remaining = 10;  // 10 ms of "do nothing"
+  }
+  if (s_skip_remaining > 0) {
+    s_skip_remaining--;
+    milli_tick_handler = app_timer_register(STEP_DELAY, milli_tick, NULL);
+    return;
+  }
+
   if (s_hasReceivedRom && s_hasReceivedSaveFile)
   {
     set_activity(ACT_TAMALIB_STEP);
@@ -443,12 +478,20 @@ static void milli_tick() //runs once every ms.
   milli_tick_handler = app_timer_register(STEP_DELAY, milli_tick, NULL); // calls itself in 1ms
 }
 
-static void screen_tick() // runs every 33 ms for about 30fps
+static void screen_tick() // runs every FPS_DELAY ms
 {
   if (s_hasReceivedRom && s_hasReceivedSaveFile)
   {
-    set_activity(ACT_SCREEN_UPDATE);
-    hal_update_screen();
+    // Only mark the Tama LCD dirty if pixels actually changed since the
+    // last redraw. The Tama LCD is mostly static between visual events,
+    // so this avoids the full layer-redraw cycle on every screen tick.
+    // This reduces peak CPU+display load, which appears to be a key
+    // factor in backlight-induced crashes on Pebble Time 2.
+    if (s_pixelsChanged) {
+      set_activity(ACT_SCREEN_UPDATE);
+      s_pixelsChanged = false;
+      layer_mark_dirty(s_screen_layer);
+    }
   }
 
   if (s_clearTextLayerOnScreenRefresh)
@@ -515,6 +558,7 @@ static void click_config_provider(void *context) {
 
 // Handles drawing icons layers
 static void icons_update_proc(Layer *layer, GContext *ctx) {
+  set_activity(ACT_DRAW_ICONS);
   // Set the draw color
   graphics_context_set_fill_color(ctx, GColorBlack);
 
@@ -594,6 +638,7 @@ static void icons_update_proc(Layer *layer, GContext *ctx) {
 static void tama_bg_update_proc(Layer *layer, GContext *ctx)
 {
 #if defined(PBL_PLATFORM_EMERY)
+  set_activity(ACT_DRAW_TAMA_BG);
   // Layer is at absolute (35, 110), size 130x96. Local coords:
   //   Tama LCD at absolute (68, 142, 64, 32) -> local (33, 32, 64, 32)
   //   Top icons at absolute y=118..140 -> local y=8..30
@@ -637,6 +682,7 @@ static void tama_bg_update_proc(Layer *layer, GContext *ctx)
 static void hands_update_proc(Layer *layer, GContext *ctx)
 {
 #if defined(PBL_PLATFORM_EMERY)
+  set_activity(ACT_DRAW_HANDS_PROC);
   GRect bounds = layer_get_bounds(layer);
   GPoint center = GPoint(bounds.size.w / 2, bounds.size.h / 2);
 
@@ -702,6 +748,7 @@ static void hands_update_proc(Layer *layer, GContext *ctx)
 
 // Handles drawing screen layer
 static void screen_update_proc(Layer *layer, GContext *ctx) { 
+  set_activity(ACT_DRAW_SCREEN_PROC);
   // draw new screen
   graphics_context_set_fill_color(ctx, GColorBlack);
 
@@ -1160,6 +1207,16 @@ static void battery_handler(BatteryChargeState state)
   sync_shadow_text(s_battery_shadow, s_battery_text);
 }
 
+// Accelerometer tap handler — the system uses these events to trigger the
+// backlight. By incrementing a counter, we signal milli_tick to skip a few
+// (very brief, ~5ms) emulator bursts during the backlight ramp-up. Doing
+// nothing for 5ms is imperceptible to the user but gives the hardware a
+// gap to handle the backlight transition without colliding with us.
+static void accel_tap_handler(AccelAxisType axis, int32_t direction)
+{
+  s_tap_count++;
+}
+
 static void main_window_load(Window *window) {
   // Get information about the Window
   Layer *window_layer = window_get_root_layer(window);
@@ -1367,6 +1424,10 @@ static void main_window_load(Window *window) {
   // Initial values + subscriptions
   battery_state_service_subscribe(battery_handler);
   battery_handler(battery_state_service_peek());
+
+  // Subscribe to tap events so we can briefly throttle CPU during
+  // backlight ramp-up (which the same events trigger).
+  accel_tap_service_subscribe(accel_tap_handler);
   update_clock_text();
   schedule_next_clock_update();
 
@@ -1392,6 +1453,7 @@ static void main_window_unload(Window *window) {
 
   // Unsubscribe battery service
   battery_state_service_unsubscribe();
+  accel_tap_service_unsubscribe();
 
   // Destroy shadow layers first (only created on Emery, NULL otherwise)
   for (int i = 0; i < 4; i++) {
