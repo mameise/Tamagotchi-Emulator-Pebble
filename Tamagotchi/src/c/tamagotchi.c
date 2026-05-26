@@ -1846,7 +1846,16 @@ static bool persistSaveState(void)
 {
   if (!s_hasReceivedRom || !s_hasReceivedSaveFile) return false;
 
-  flat_state_t st = cpu_get_flat_state();
+  // Mark activity so we know if a crash happened during the save.
+  set_activity(ACT_AUTOSAVE);
+
+  // flat_state_t is ~520 bytes (incl. memory[]). Putting it on the stack
+  // during the save would put us close to Pebble's 8KB app-stack limit,
+  // especially since we're called from a timer callback inside the event
+  // loop which already has its own stack frames. Static storage avoids
+  // any chance of stack overflow.
+  static flat_state_t st;
+  st = cpu_get_flat_state();
 
   // Sanity check: refuse to save obviously-bad state
   if (st.pc == 0) {
