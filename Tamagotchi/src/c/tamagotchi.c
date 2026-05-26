@@ -1750,7 +1750,19 @@ static void saveCurrentState(bool isAutoSave)
 
 static void saveCurrentStateAndQuit()
 {
-  saveCurrentState(false);
+  // Manual exit: save locally to watch persist storage (fast, reliable,
+  // works without Bluetooth) and quit. We don't bother trying to send
+  // state to the phone here — the local save is sufficient since we
+  // boot from local storage on next startup. The auto-save timer also
+  // keeps the local state fresh while the app is running.
+  if (s_hasReceivedRom && s_hasReceivedSaveFile) {
+    if (persistSaveState()) {
+      APP_LOG(APP_LOG_LEVEL_INFO, "Manual exit: state saved to watch storage");
+    } else {
+      APP_LOG(APP_LOG_LEVEL_WARNING, "Manual exit: persistSaveState failed");
+    }
+  }
+  Quit();
 }
 
 // Load ROM from app resource (built-in, no phone needed).
