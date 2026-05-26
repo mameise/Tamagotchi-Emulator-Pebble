@@ -1,8 +1,12 @@
 #define bitRead(value, bit) (((value) >> (bit)) & 0x01)
-#define FPS 30
+#define FPS 20
 #define FPS_DELAY 1000/FPS //ms
 #define STEP_DELAY 1 //ms
-#define STEPS_PER_DELAY 600
+// Reduced from Stefan's 600 to lower CPU load. The Tama CPU runs at ~32kHz
+// natively; even at 400 steps/ms the emulated CPU runs much faster than
+// needed. RTC sync periodically nudges the Tama clock back to reality so
+// emulation speed doesn't have to be precise.
+#define STEPS_PER_DELAY 400
 
 #define VRAM_SIZE (64 + 13)
 #define BYTES_PER_LINE 32
